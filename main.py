@@ -31,14 +31,19 @@ user_state = {}
 
 # --- Init ---
 app = Client("manager_interface", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-scheduler = AsyncIOScheduler(timezone=IST)
+# GRACE TIME: If bot is offline, run missed tasks if they are <60s late
+scheduler = AsyncIOScheduler(timezone=IST, job_defaults={'misfire_grace_time': 60})
 
 # --- Persistence ---
 def load_db():
     global data
     if os.path.exists(DB_FILE):
-        with open(DB_FILE, "r") as f:
-            data = json.load(f)
+        try:
+            with open(DB_FILE, "r") as f:
+                data = json.load(f)
+        except json.JSONDecodeError:
+            print("⚠️ JSON Error: Database corrupted. Starting fresh.")
+            data = {"sessions": {}, "tasks": {}, "channels": {}}
 
 def save_db():
     with open(DB_FILE, "w") as f:
@@ -48,13 +53,12 @@ def is_authorized(user_id):
     if not ADMIN_IDS: return True
     return user_id in ADMIN_IDS
 
-async def get_user_client(user_id):
+# FIX 1: Return Client Object (Don't start it here)
+# This allows 'async with' to handle cleanup automatically
+def get_user_client(user_id):
     session = data["sessions"].get(str(user_id))
     if not session: return None
-    # We use :memory: so it doesn't conflict with files, but we must resolve peers manually
-    user_app = Client(f":memory:", api_id=API_ID, api_hash=API_HASH, session_string=session, no_updates=True)
-    await user_app.start()
-    return user_app
+    return Client(f":memory:", api_id=API_ID, api_hash=API_HASH, session_string=session, no_updates=True)
 
 def get_next_run_time(start_dt, interval):
     if not interval: return "One Time"
@@ -246,7 +250,7 @@ async def show_main_menu(m):
 async def show_channels_list(uid, m):
     user_chs = data["channels"].get(str(uid), {})
     if not user_chs:
-        await m.edit_text("ℹ️ **No Channels**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Add Channel", callback_data="add_channel"), InlineKeyboardButton("🔙 Back", callback_data="menu_home")]]))
+        await m.edit_text("ℹ️ **No Channels**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Add Channel", callback_data="add_channel"), InlineKeyboardButton("🔙 Back", callback_data="menu_home")]])
         return
     kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"📢 {t}", callback_data=f"manage_ch_{c}")] for c, t in user_chs.items()] + [[InlineKeyboardButton("🔙 Back", callback_data="menu_home")]])
     await m.edit_text("**Select Channel:**", reply_markup=kb)
@@ -267,9 +271,16 @@ async def show_active_tasks(uid, m, c_id):
     txt = "**Active Schedules:**\n"
     kb = []
     for tid, t in tasks.items():
-        nxt = get_next_run_time(datetime.datetime.fromisoformat(t["start_time_iso"]), t["repeat_interval"])
-        txt += f"• Next: `{nxt}`\n"
-        kb.append([InlineKeyboardButton(f"🛑 Stop Task", callback_data=f"del_task_{tid}")])
+        # FIX 2: Ensure correct datetime object for calculation
+        try:
+            start_dt = datetime.datetime.fromisoformat(t["start_time_iso"])
+            nxt = get_next_run_time(start_dt, t["repeat_interval"])
+            txt += f"• Next: `{nxt}`\n"
+            kb.append([InlineKeyboardButton(f"🛑 Stop Task", callback_data=f"del_task_{tid}")])
+        except Exception as e:
+            # Corrupt task, remove logic could go here
+            continue
+
     kb.append([InlineKeyboardButton("🔙 Back", callback_data=f"manage_ch_{c_id}")])
     await m.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
 
@@ -323,58 +334,70 @@ async def handle_schedule_logic(uid, query, d):
         user_state[uid] = None
         await query.message.edit_text("✅ **Scheduled!**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu", callback_data="menu_home")]]))
 
-# --- Worker (UPDATED FIX) ---
+# --- Worker (Robust Version) ---
 def add_job(t_id, t):
-    start_dt = datetime.datetime.fromisoformat(t["start_time_iso"])
+    try:
+        start_dt = datetime.datetime.fromisoformat(t["start_time_iso"])
+    except:
+        # Prevent crash on bad date format
+        print(f"Skipping bad task {t_id}")
+        return
+
     async def worker():
         try:
             print(f"DEBUG: Starting Task {t_id}")
-            user = await get_user_client(t["owner_id"])
-            if not user: 
-                print("DEBUG: No User Client found!")
+            
+            # 1. Get User Client Object (Not Started)
+            user_client = get_user_client(t["owner_id"])
+            if not user_client:
+                print("DEBUG: Session not found. Task paused.")
+                # We do not delete the task here in case session comes back
                 return
             
-            # --- PEER RESOLUTION FIX ---
-            # We force the User Bot to 'find' the channel ID.
-            # Without this, it gets PeerIdInvalid because it's a fresh session.
-            try:
-                print(f"DEBUG: Resolving Peer {t['chat_id']}")
-                target_chat = await user.get_chat(int(t["chat_id"]))
-                print(f"DEBUG: Found Channel: {target_chat.title}")
-            except Exception as peer_err:
-                print(f"DEBUG: Failed to resolve peer: {peer_err}")
-                await user.stop()
-                return
+            # FIX 3: Context Manager for Memory Safety
+            # "async with" ensures client.stop() is ALWAYS called, preventing memory leaks
+            async with user_client as user:
+                
+                # 2. Peer Resolution (Fixes "PeerIdInvalid" errors)
+                try:
+                    target_chat = await user.get_chat(int(t["chat_id"]))
+                except Exception as e:
+                    print(f"DEBUG: Chat access failed: {e}")
+                    return
 
-            if t["delete_old"] and t["last_msg_id"]:
-                try: await user.delete_messages(int(t["chat_id"]), t["last_msg_id"])
-                except: pass
-            
-            orig = await app.get_messages(t["source_chat"], t["msg_id"])
-            sent = None
-            
-            print("DEBUG: Sending Message...")
-            if orig.text: sent = await user.send_message(int(t["chat_id"]), orig.text, entities=orig.entities)
-            elif orig.photo: sent = await user.send_photo(int(t["chat_id"]), orig.photo.file_id, caption=orig.caption, caption_entities=orig.caption_entities)
-            elif orig.video: sent = await user.send_video(int(t["chat_id"]), orig.video.file_id, caption=orig.caption, caption_entities=orig.caption_entities)
-            elif orig.document: sent = await user.send_document(int(t["chat_id"]), orig.document.file_id, caption=orig.caption, caption_entities=orig.caption_entities)
+                # 3. Delete Old Message
+                if t["delete_old"] and t["last_msg_id"]:
+                    try: await user.delete_messages(int(t["chat_id"]), t["last_msg_id"])
+                    except: pass
+                
+                # 4. Fetch Original Message (ZOMBIE TASK FIX)
+                try:
+                    orig = await app.get_messages(t["source_chat"], t["msg_id"])
+                    if not orig or orig.empty: raise ValueError("Message deleted")
+                except Exception as e:
+                    print(f"DEBUG: Source message gone: {e}")
+                    # If source msg deleted, KILL TASK so it doesn't loop error
+                    try: scheduler.remove_job(t_id)
+                    except: pass
+                    if t_id in data["tasks"]: del data["tasks"][t_id]; save_db()
+                    return
 
-            if sent:
-                print(f"DEBUG: Sent successfully! Msg ID: {sent.id}")
-                if t["pin"]: 
-                    try: 
-                        print("DEBUG: Attempting to Pin...")
-                        await sent.pin()
-                        print("DEBUG: Pinned!")
-                    except Exception as pin_e:
-                        print(f"DEBUG: Pin Failed: {pin_e}")
+                # 5. Send
+                sent = None
+                print("DEBUG: Sending...")
+                if orig.text: sent = await user.send_message(int(t["chat_id"]), orig.text, entities=orig.entities)
+                elif orig.photo: sent = await user.send_photo(int(t["chat_id"]), orig.photo.file_id, caption=orig.caption, caption_entities=orig.caption_entities)
+                elif orig.video: sent = await user.send_video(int(t["chat_id"]), orig.video.file_id, caption=orig.caption, caption_entities=orig.caption_entities)
+                elif orig.document: sent = await user.send_document(int(t["chat_id"]), orig.document.file_id, caption=orig.caption, caption_entities=orig.caption_entities)
 
-                data["tasks"][t_id]["last_msg_id"] = sent.id
-                save_db()
-            else:
-                print("DEBUG: Failed to send (sent is None)")
+                if sent:
+                    print(f"DEBUG: Sent! ID: {sent.id}")
+                    if t["pin"]: 
+                        try: await sent.pin()
+                        except: pass
+                    data["tasks"][t_id]["last_msg_id"] = sent.id
+                    save_db()
 
-            await user.stop()
         except Exception as e:
             print(f"DEBUG: CRITICAL WORKER ERROR: {e}")
 
