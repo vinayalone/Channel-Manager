@@ -4,7 +4,6 @@ import logging
 import asyncio
 import datetime
 import pytz
-
 from pyrogram import Client, filters, errors
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -465,11 +464,36 @@ def parse_interval(text):
     except: return None
 
 # --- Main ---
-from pyrogram import enums # Import enums for channel check
+from pyrogram import idle, enums  # Added 'idle' to keep the bot running
+
+async def boot_services():
+    # 1. Start the Bot (Connects to Telegram)
+    await app.start()
+    print("✅ Bot Started")
+
+    # 2. Start the Scheduler (Now that the Loop is definitively running)
+    scheduler.start()
+    print("✅ Scheduler Started")
+
+    # 3. Keep the bot running until you stop it
+    await idle()
+    
+    # 4. Stop gracefully
+    await app.stop()
+    print("🛑 Bot Stopped")
 
 if __name__ == "__main__":
     load_db()
+    
+    # Reload saved tasks into memory
+    print("🔄 Loading tasks...")
     for k, v in data["tasks"].items():
-        add_job(k, v)
-    scheduler.start()
-    app.run()
+        try:
+            add_job(k, v)
+        except Exception as e:
+            print(f"Failed to load task {k}: {e}")
+
+    # Start everything using app.run()
+    # This automatically creates the Event Loop first, preventing the crash
+    print("🚀 Launching...")
+    app.run(boot_services())
