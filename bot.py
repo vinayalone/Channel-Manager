@@ -1,5 +1,6 @@
 import os
 import logging
+from io import StringIO
 from datetime import datetime, timedelta
 from telethon import TelegramClient
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -342,7 +343,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("logout_yes"):
         attempts = context.user_data.get('logout_attempts', 0) + 1
+        context.user_data['logout_attempts'] = attempts # Update the count
+
         if attempts < 3:
-            await query.edit_message_text(f"Are you sure? ({attempts+1}/3) Yes/No", reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Yes", callback_data="logout_yes"), InlineKeyboardButton("No", callback_data="logout_no")]
-            ]
+            await query.edit_message_text(
+                f"Are you sure? ({attempts+1}/3) Yes/No", 
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Yes", callback_data="logout_yes"), 
+                     InlineKeyboardButton("No", callback_data="logout_no")]
+                ]) # This closes the list and the Markup class
+            ) # This closes the edit_message_text function
+        else:
+            # Logic for when they finally click 'Yes' the 3rd time
+            user_id = update.effective_user.id
+            if user_id in clients:
+                await clients[user_id].disconnect()
+                del clients[user_id]
+            
+            session_db.query(UserSession).filter_by(user_id=user_id).delete()
+            session_db.commit()
+            await query.edit_message_text("You have been logged out successfully.")
