@@ -7,7 +7,7 @@ import pytz
 from typing import Dict, List, Optional, Any
 
 from pyrogram import Client, filters, idle, errors, enums
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message, InputFile
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.date import DateTrigger
@@ -80,7 +80,7 @@ class BotManager:
             next_run += delta
         return next_run.strftime('%d-%b %H:%M')
 
-    # --- THE WORKER (Crucial Missing Part) ---
+    # --- THE WORKER ---
     def add_job(self, t_id: str, t: Dict[str, Any]) -> None:
         try:
             start_dt = datetime.datetime.fromisoformat(t["start_time_iso"])
@@ -164,7 +164,8 @@ async def cmd_export(client: Client, message: Message):
     if not manager.is_authorized(message.from_user.id): return
     manager.save_db()
     if os.path.exists(DB_FILE):
-        await message.reply_document(InputFile(DB_FILE), caption="📁 **Database Export**")
+        # FIX: Removed InputFile wrapper, passing path directly
+        await message.reply_document(DB_FILE, caption="📁 **Database Export**")
     else:
         await message.reply("No database found.")
 
