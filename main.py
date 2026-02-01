@@ -16,15 +16,12 @@ API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-# Force Timezone to Asia/Kolkata
 IST = pytz.timezone('Asia/Kolkata')
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ManagerBot")
 
 # --- INIT ---
-app = Client("manager_v5", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-# Critical Fix: Ensure scheduler uses the correct event loop
+app = Client("manager_final_v1", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 scheduler = AsyncIOScheduler(timezone=IST)
 db_pool = None
 
@@ -45,14 +42,9 @@ async def init_db():
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_sessions (user_id BIGINT PRIMARY KEY, session_string TEXT)''')
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_channels (user_id BIGINT, channel_id TEXT, title TEXT, PRIMARY KEY(user_id, channel_id))''')
         
-        # --- SMART FIX: AUTO-UPGRADE TABLE ---
-        try:
-            await conn.execute("SELECT content_type FROM userbot_tasks LIMIT 1")
-        except:
-            print("⚠️ Upgrading Database Schema...")
-            await conn.execute("DROP TABLE IF EXISTS userbot_tasks")
-
-        await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_tasks 
+        # --- FIX: NEW TABLE NAME TO FORCE FRESH CREATION ---
+        # We renamed 'userbot_tasks' to 'userbot_tasks_final' to bypass the stuck schema error.
+        await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_tasks_final 
                           (task_id TEXT PRIMARY KEY, owner_id BIGINT, chat_id TEXT, 
                            content_type TEXT, content_text TEXT, file_id TEXT, 
                            pin BOOLEAN, delete_old BOOLEAN, 
@@ -86,31 +78,35 @@ async def del_channel(user_id, cid):
 
 async def save_task(t):
     pool = await get_db()
+    # --- FIX: EXPLICIT COLUMN NAMES ---
+    # This prevents the "INSERT has more expressions" error forever.
     await pool.execute("""
-        INSERT INTO userbot_tasks VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        INSERT INTO userbot_tasks_final 
+        (task_id, owner_id, chat_id, content_type, content_text, file_id, pin, delete_old, repeat_interval, start_time, last_msg_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         ON CONFLICT (task_id) DO UPDATE SET last_msg_id = $11, start_time = $10
     """, t['task_id'], t['owner_id'], t['chat_id'], t['content_type'], t['content_text'], t['file_id'], 
        t['pin'], t['delete_old'], t['repeat_interval'], t['start_time'], t['last_msg_id'])
 
 async def get_all_tasks():
     pool = await get_db()
-    return [dict(x) for x in await pool.fetch("SELECT * FROM userbot_tasks")]
+    return [dict(x) for x in await pool.fetch("SELECT * FROM userbot_tasks_final")]
 
 async def get_user_tasks(user_id, chat_id):
     pool = await get_db()
-    return [dict(x) for x in await pool.fetch("SELECT * FROM userbot_tasks WHERE owner_id = $1 AND chat_id = $2", user_id, chat_id)]
+    return [dict(x) for x in await pool.fetch("SELECT * FROM userbot_tasks_final WHERE owner_id = $1 AND chat_id = $2", user_id, chat_id)]
 
 async def delete_task(task_id):
     pool = await get_db()
-    await pool.execute("DELETE FROM userbot_tasks WHERE task_id = $1", task_id)
+    await pool.execute("DELETE FROM userbot_tasks_final WHERE task_id = $1", task_id)
 
 async def update_last_msg(task_id, msg_id):
     pool = await get_db()
-    await pool.execute("UPDATE userbot_tasks SET last_msg_id = $1 WHERE task_id = $2", msg_id, task_id)
+    await pool.execute("UPDATE userbot_tasks_final SET last_msg_id = $1 WHERE task_id = $2", msg_id, task_id)
 
 async def update_next_run(task_id, next_time_str):
     pool = await get_db()
-    await pool.execute("UPDATE userbot_tasks SET start_time = $1 WHERE task_id = $2", next_time_str, task_id)
+    await pool.execute("UPDATE userbot_tasks_final SET start_time = $1 WHERE task_id = $2", next_time_str, task_id)
 
 # --- BOT INTERFACE ---
 
@@ -121,7 +117,7 @@ async def start_cmd(c, m):
         await show_main_menu(m)
     else:
         await m.reply_text(
-            "👋 **Manager Bot v5**\n\nI schedule posts for you.\nFirst, I need to log in to your account.",
+            "👋 **Manager Bot Final**\n\nI schedule posts for you.\nFirst, I need to log in to your account.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Login", callback_data="login_start")]])
         )
 
@@ -167,9 +163,9 @@ async def callback_router(c, q):
     elif d.startswith("time_"):
         offset = d.split("time_")[1] 
         now = datetime.datetime.now(IST)
-        # Fix: Ensure seconds are zeroed out for cleaner scheduling
+        # Fix: Ensure clean seconds for precise scheduling
         if offset == "0":
-            run_time = now + datetime.timedelta(seconds=5)
+            run_time = now + datetime.timedelta(seconds=10)
         else:
             run_time = now + datetime.timedelta(minutes=int(offset))
         
@@ -211,7 +207,7 @@ async def callback_router(c, q):
         await q.answer("Task deleted")
         await show_main_menu(q.message)
 
-# --- MESSAGES & INPUTS ---
+# --- INPUTS ---
 
 @app.on_message(filters.private & ~filters.command("manage") & ~filters.command("start"))
 async def handle_inputs(c, m):
@@ -267,7 +263,7 @@ async def handle_inputs(c, m):
         ]
         await m.reply("2️⃣ **When should I post this?**", reply_markup=InlineKeyboardMarkup(kb))
 
-# --- UI HELPERS (FIXED DATE DISPLAY) ---
+# --- UI HELPERS ---
 
 async def show_main_menu(m):
     kb = [[InlineKeyboardButton("📢 My Channels", callback_data="list_channels"), InlineKeyboardButton("➕ Connect Channel", callback_data="add_channel")],
@@ -303,16 +299,11 @@ async def list_active_tasks(uid, m, cid):
     txt = "**Active Tasks:**\n"
     kb = []
     for t in tasks:
-        # --- FIX: ROBUST DATE PARSING ---
         try:
-            # Parse the ISO string back to a datetime object
             dt = datetime.datetime.fromisoformat(t["start_time"])
-            # Format it nicely
             time_str = dt.strftime('%d-%b %I:%M %p')
-        except Exception as e:
-            # Fallback if format is wrong
-            time_str = "Checking..."
-        # --------------------------------
+        except:
+            time_str = "Unknown"
         
         txt += f"• {t['content_type'].upper()} at `{time_str}`\n(Rep: {t['repeat_interval'] or 'No'})\n"
         kb.append([InlineKeyboardButton("🗑 Delete Task", callback_data=f"del_task_{t['task_id']}")])
@@ -380,26 +371,35 @@ async def create_task_logic(uid, q):
         "last_msg_id": None
     }
     
-    await save_task(task_data)
-    add_scheduler_job(tid, task_data)
-    user_state[uid] = None
-    await q.message.edit_text("🎉 **Done!** Post scheduled.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu", callback_data="menu_home")]]))
+    try:
+        await save_task(task_data)
+        add_scheduler_job(tid, task_data)
+        await q.message.edit_text("🎉 **Done!** Post scheduled.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu", callback_data="menu_home")]]))
+    except Exception as e:
+        logger.error(f"Save Task Error: {e}")
+        await q.message.edit_text(f"❌ Error saving task: {e}")
 
-# --- WORKER (FIXED SENDING LOGIC) ---
+# --- WORKER (DEBUGGING LOGS ADDED) ---
 def add_scheduler_job(tid, t):
     async def job_func():
+        logger.info(f"⚡ Job {tid} Starting...")
         try:
             session = await get_session(t["owner_id"])
-            if not session: return 
+            if not session:
+                logger.error(f"❌ Job {tid}: No session found for user {t['owner_id']}")
+                return 
             
-            # Start a temporary client for this job
             async with Client(":memory:", api_id=API_ID, api_hash=API_HASH, session_string=session) as user:
                 target = int(t["chat_id"])
+                logger.info(f"🔹 Job {tid}: Logged in. Target: {target}")
                 
                 # 1. Delete Old Message
                 if t["delete_old"] and t["last_msg_id"]:
-                    try: await user.delete_messages(target, int(t["last_msg_id"]))
-                    except: pass
+                    try: 
+                        await user.delete_messages(target, int(t["last_msg_id"]))
+                        logger.info(f"🗑️ Job {tid}: Deleted old msg {t['last_msg_id']}")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Job {tid}: Failed delete: {e}")
                 
                 # 2. Send New Message
                 sent = None
@@ -416,26 +416,30 @@ def add_scheduler_job(tid, t):
                         sent = await user.send_document(target, t["file_id"], caption=caption)
                     elif t["content_type"] == "sticker":
                         sent = await user.send_sticker(target, t["file_id"])
+                    
+                    logger.info(f"✅ Job {tid}: Message Sent! ID: {sent.id}")
                 except Exception as send_err:
-                    logger.error(f"Failed to send: {send_err}")
-                    return # Stop if sending failed
+                    logger.error(f"❌ Job {tid} SEND ERROR: {send_err}")
+                    return 
 
                 if sent:
                     if t["pin"]:
                         try: await sent.pin()
                         except: pass
                     
+                    # UPDATE DB
                     await update_last_msg(tid, sent.id)
                     
-                    # 3. UPDATE NEXT RUN TIME (Database Update)
+                    # 3. UPDATE NEXT RUN TIME
                     if t["repeat_interval"]:
                         now = datetime.datetime.now(IST)
                         mins = int(t["repeat_interval"].split("=")[1])
                         next_run = now + datetime.timedelta(minutes=mins)
                         await update_next_run(tid, next_run.isoformat())
+                        logger.info(f"🔄 Job {tid}: Rescheduled to {next_run}")
                     
         except Exception as e:
-            logger.error(f"Worker Error {tid}: {e}")
+            logger.error(f"🔥 Job {tid} CRITICAL FAIL: {e}")
 
     dt = datetime.datetime.fromisoformat(t["start_time"])
     trigger = None
@@ -493,6 +497,7 @@ async def main():
     await init_db()
     try:
         tasks = await get_all_tasks()
+        logger.info(f"📂 Loaded {len(tasks)} tasks from DB")
         for t in tasks:
             add_scheduler_job(t['task_id'], t)
     except Exception as e:
