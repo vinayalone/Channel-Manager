@@ -21,7 +21,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ManagerBot")
 
 # --- INIT ---
-app = Client("manager_final_v1", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("manager_ultra_final", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 scheduler = AsyncIOScheduler(timezone=IST)
 db_pool = None
 
@@ -42,9 +42,8 @@ async def init_db():
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_sessions (user_id BIGINT PRIMARY KEY, session_string TEXT)''')
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_channels (user_id BIGINT, channel_id TEXT, title TEXT, PRIMARY KEY(user_id, channel_id))''')
         
-        # --- FIX: NEW TABLE NAME TO FORCE FRESH CREATION ---
-        # We renamed 'userbot_tasks' to 'userbot_tasks_final' to bypass the stuck schema error.
-        await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_tasks_final 
+        # Using a new table name to ensure fresh start and avoid schema conflicts
+        await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_tasks_v2 
                           (task_id TEXT PRIMARY KEY, owner_id BIGINT, chat_id TEXT, 
                            content_type TEXT, content_text TEXT, file_id TEXT, 
                            pin BOOLEAN, delete_old BOOLEAN, 
@@ -78,10 +77,8 @@ async def del_channel(user_id, cid):
 
 async def save_task(t):
     pool = await get_db()
-    # --- FIX: EXPLICIT COLUMN NAMES ---
-    # This prevents the "INSERT has more expressions" error forever.
     await pool.execute("""
-        INSERT INTO userbot_tasks_final 
+        INSERT INTO userbot_tasks_v2 
         (task_id, owner_id, chat_id, content_type, content_text, file_id, pin, delete_old, repeat_interval, start_time, last_msg_id)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         ON CONFLICT (task_id) DO UPDATE SET last_msg_id = $11, start_time = $10
@@ -90,23 +87,23 @@ async def save_task(t):
 
 async def get_all_tasks():
     pool = await get_db()
-    return [dict(x) for x in await pool.fetch("SELECT * FROM userbot_tasks_final")]
+    return [dict(x) for x in await pool.fetch("SELECT * FROM userbot_tasks_v2")]
 
 async def get_user_tasks(user_id, chat_id):
     pool = await get_db()
-    return [dict(x) for x in await pool.fetch("SELECT * FROM userbot_tasks_final WHERE owner_id = $1 AND chat_id = $2", user_id, chat_id)]
+    return [dict(x) for x in await pool.fetch("SELECT * FROM userbot_tasks_v2 WHERE owner_id = $1 AND chat_id = $2", user_id, chat_id)]
 
 async def delete_task(task_id):
     pool = await get_db()
-    await pool.execute("DELETE FROM userbot_tasks_final WHERE task_id = $1", task_id)
+    await pool.execute("DELETE FROM userbot_tasks_v2 WHERE task_id = $1", task_id)
 
 async def update_last_msg(task_id, msg_id):
     pool = await get_db()
-    await pool.execute("UPDATE userbot_tasks_final SET last_msg_id = $1 WHERE task_id = $2", msg_id, task_id)
+    await pool.execute("UPDATE userbot_tasks_v2 SET last_msg_id = $1 WHERE task_id = $2", msg_id, task_id)
 
 async def update_next_run(task_id, next_time_str):
     pool = await get_db()
-    await pool.execute("UPDATE userbot_tasks_final SET start_time = $1 WHERE task_id = $2", next_time_str, task_id)
+    await pool.execute("UPDATE userbot_tasks_v2 SET start_time = $1 WHERE task_id = $2", next_time_str, task_id)
 
 # --- BOT INTERFACE ---
 
@@ -117,7 +114,7 @@ async def start_cmd(c, m):
         await show_main_menu(m)
     else:
         await m.reply_text(
-            "👋 **Manager Bot Final**\n\nI schedule posts for you.\nFirst, I need to log in to your account.",
+            "👋 **Manager Bot Ultra**\n\nI schedule posts for you.\nFirst, I need to log in to your account.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Login", callback_data="login_start")]])
         )
 
@@ -163,11 +160,13 @@ async def callback_router(c, q):
     elif d.startswith("time_"):
         offset = d.split("time_")[1] 
         now = datetime.datetime.now(IST)
-        # Fix: Ensure clean seconds for precise scheduling
+        # Clean seconds for nice scheduling
         if offset == "0":
-            run_time = now + datetime.timedelta(seconds=10)
+            run_time = now + datetime.timedelta(seconds=5)
         else:
             run_time = now + datetime.timedelta(minutes=int(offset))
+            # Zero out seconds for cleaner DB look
+            run_time = run_time.replace(second=0, microsecond=0)
         
         user_state[uid]["start_time"] = run_time
         await ask_repetition(q.message, uid)
@@ -379,27 +378,47 @@ async def create_task_logic(uid, q):
         logger.error(f"Save Task Error: {e}")
         await q.message.edit_text(f"❌ Error saving task: {e}")
 
-# --- WORKER (DEBUGGING LOGS ADDED) ---
+# --- WORKER (FIXED) ---
 def add_scheduler_job(tid, t):
     async def job_func():
         logger.info(f"⚡ Job {tid} Starting...")
+        
+        # 1. Calculate NEXT RUN immediately (So DB updates even if send fails)
+        next_run_iso = None
+        if t["repeat_interval"]:
+            try:
+                now = datetime.datetime.now(IST)
+                mins = int(t["repeat_interval"].split("=")[1])
+                next_run = now + datetime.timedelta(minutes=mins)
+                next_run_iso = next_run.isoformat()
+            except: pass
+
         try:
             session = await get_session(t["owner_id"])
             if not session:
-                logger.error(f"❌ Job {tid}: No session found for user {t['owner_id']}")
+                logger.error(f"❌ Job {tid}: No session found.")
                 return 
             
             async with Client(":memory:", api_id=API_ID, api_hash=API_HASH, session_string=session) as user:
                 target = int(t["chat_id"])
-                logger.info(f"🔹 Job {tid}: Logged in. Target: {target}")
                 
+                # --- KEY FIX: REFRESH PEERS ---
+                # This fetches your dialogs to cache the Access Hash
+                # without this, "Peer Id Invalid" happens for private channels
+                try:
+                    logger.info(f"🔄 Job {tid}: Refreshing dialogs to find access hash...")
+                    await user.get_dialogs(limit=50) # Fetch top 50 chats to populate cache
+                except Exception as e:
+                    logger.warning(f"⚠️ Dialog refresh warning: {e}")
+                # ------------------------------
+
                 # 1. Delete Old Message
                 if t["delete_old"] and t["last_msg_id"]:
                     try: 
                         await user.delete_messages(target, int(t["last_msg_id"]))
-                        logger.info(f"🗑️ Job {tid}: Deleted old msg {t['last_msg_id']}")
+                        logger.info(f"🗑️ Job {tid}: Deleted old msg")
                     except Exception as e:
-                        logger.warning(f"⚠️ Job {tid}: Failed delete: {e}")
+                        logger.warning(f"⚠️ Job {tid} Delete Fail: {e}")
                 
                 # 2. Send New Message
                 sent = None
@@ -420,26 +439,26 @@ def add_scheduler_job(tid, t):
                     logger.info(f"✅ Job {tid}: Message Sent! ID: {sent.id}")
                 except Exception as send_err:
                     logger.error(f"❌ Job {tid} SEND ERROR: {send_err}")
-                    return 
+                    # Don't return, allow DB update below
 
                 if sent:
                     if t["pin"]:
                         try: await sent.pin()
                         except: pass
-                    
-                    # UPDATE DB
+                    # Update Last Msg ID
                     await update_last_msg(tid, sent.id)
-                    
-                    # 3. UPDATE NEXT RUN TIME
-                    if t["repeat_interval"]:
-                        now = datetime.datetime.now(IST)
-                        mins = int(t["repeat_interval"].split("=")[1])
-                        next_run = now + datetime.timedelta(minutes=mins)
-                        await update_next_run(tid, next_run.isoformat())
-                        logger.info(f"🔄 Job {tid}: Rescheduled to {next_run}")
-                    
+
         except Exception as e:
             logger.error(f"🔥 Job {tid} CRITICAL FAIL: {e}")
+        
+        finally:
+            # 3. ALWAYS UPDATE NEXT RUN TIME (Even if send failed)
+            if next_run_iso:
+                try:
+                    await update_next_run(tid, next_run_iso)
+                    logger.info(f"🔄 Job {tid}: DB Updated for next run.")
+                except Exception as e:
+                    logger.error(f"DB Update Fail: {e}")
 
     dt = datetime.datetime.fromisoformat(t["start_time"])
     trigger = None
