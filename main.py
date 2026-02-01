@@ -10,30 +10,26 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.date import DateTrigger
 
-# --- CONFIGURATION (From Railway Variables) ---
+# --- CONFIGURATION ---
 API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-# Admin IDs: Comma separated list of users who can own the bot
-ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
-
 IST = pytz.timezone('Asia/Kolkata')
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ManagerBot")
 
-# --- INIT CLIENTS ---
-app = Client("manager_interface", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# --- INIT ---
+app = Client("manager_v2", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 scheduler = AsyncIOScheduler(timezone=IST)
-
-# Global Cache (For temporary state during conversation)
-login_state = {}
-user_state = {}
 db_pool = None
 
-# --- DATABASE HELPERS (AsyncPG) ---
+# Global Cache
+login_state = {}
+user_state = {}
 
+# --- DATABASE (AsyncPG) ---
 async def get_db():
     global db_pool
     if not db_pool:
@@ -43,60 +39,58 @@ async def get_db():
 async def init_db():
     pool = await get_db()
     async with pool.acquire() as conn:
-        # Sessions table
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_sessions (user_id BIGINT PRIMARY KEY, session_string TEXT)''')
-        # Channels table
+        # channels: stores channel_id and title
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_channels (user_id BIGINT, channel_id TEXT, title TEXT, PRIMARY KEY(user_id, channel_id))''')
-        # Tasks table
+        # tasks: stores content type and file_id instead of just msg_id
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_tasks 
-                          (task_id TEXT PRIMARY KEY, owner_id BIGINT, chat_id TEXT, msg_id BIGINT, 
-                           source_chat BIGINT, pin BOOLEAN, delete_old BOOLEAN, 
+                          (task_id TEXT PRIMARY KEY, owner_id BIGINT, chat_id TEXT, 
+                           content_type TEXT, content_text TEXT, file_id TEXT, 
+                           pin BOOLEAN, delete_old BOOLEAN, 
                            repeat_interval TEXT, start_time TEXT, last_msg_id BIGINT)''')
 
-# --- DB CRUD OPERATIONS ---
-
+# --- DB HELPERS ---
 async def get_session(user_id):
     pool = await get_db()
     row = await pool.fetchrow("SELECT session_string FROM userbot_sessions WHERE user_id = $1", user_id)
     return row['session_string'] if row else None
 
-async def save_session(user_id, session_string):
+async def save_session(user_id, session):
     pool = await get_db()
-    await pool.execute("INSERT INTO userbot_sessions (user_id, session_string) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET session_string = $2", user_id, session_string)
+    await pool.execute("INSERT INTO userbot_sessions (user_id, session_string) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET session_string = $2", user_id, session)
 
 async def del_session(user_id):
     pool = await get_db()
     await pool.execute("DELETE FROM userbot_sessions WHERE user_id = $1", user_id)
 
+async def add_channel(user_id, cid, title):
+    pool = await get_db()
+    await pool.execute("INSERT INTO userbot_channels (user_id, channel_id, title) VALUES ($1, $2, $3) ON CONFLICT (user_id, channel_id) DO UPDATE SET title = $3", user_id, cid, title)
+
 async def get_channels(user_id):
     pool = await get_db()
-    return await pool.fetch("SELECT channel_id, title FROM userbot_channels WHERE user_id = $1", user_id)
+    return await pool.fetch("SELECT * FROM userbot_channels WHERE user_id = $1", user_id)
 
-async def add_channel_db(user_id, c_id, title):
+async def del_channel(user_id, cid):
     pool = await get_db()
-    await pool.execute("INSERT INTO userbot_channels (user_id, channel_id, title) VALUES ($1, $2, $3) ON CONFLICT (user_id, channel_id) DO UPDATE SET title = $3", user_id, c_id, title)
-
-async def del_channel_db(user_id, c_id):
-    pool = await get_db()
-    await pool.execute("DELETE FROM userbot_channels WHERE user_id = $1 AND channel_id = $2", user_id, c_id)
+    await pool.execute("DELETE FROM userbot_channels WHERE user_id = $1 AND channel_id = $2", user_id, cid)
 
 async def save_task(t):
     pool = await get_db()
+    # Safely insert None values
     await pool.execute("""
-        INSERT INTO userbot_tasks (task_id, owner_id, chat_id, msg_id, source_chat, pin, delete_old, repeat_interval, start_time, last_msg_id)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-        ON CONFLICT (task_id) DO UPDATE SET last_msg_id = $10
-    """, t['task_id'], t['owner_id'], t['chat_id'], t['msg_id'], t['source_chat'], t['pin'], t['delete_old'], t['repeat_interval'], t['start_time'], t['last_msg_id'])
+        INSERT INTO userbot_tasks VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        ON CONFLICT (task_id) DO UPDATE SET last_msg_id = $11
+    """, t['task_id'], t['owner_id'], t['chat_id'], t['content_type'], t['content_text'], t['file_id'], 
+       t['pin'], t['delete_old'], t['repeat_interval'], t['start_time'], t['last_msg_id'])
 
 async def get_all_tasks():
     pool = await get_db()
-    rows = await pool.fetch("SELECT * FROM userbot_tasks")
-    return [dict(row) for row in rows]
+    return [dict(x) for x in await pool.fetch("SELECT * FROM userbot_tasks")]
 
-async def get_tasks_by_channel(user_id, chat_id):
+async def get_user_tasks(user_id, chat_id):
     pool = await get_db()
-    rows = await pool.fetch("SELECT * FROM userbot_tasks WHERE owner_id = $1 AND chat_id = $2", user_id, chat_id)
-    return [dict(row) for row in rows]
+    return [dict(x) for x in await pool.fetch("SELECT * FROM userbot_tasks WHERE owner_id = $1 AND chat_id = $2", user_id, chat_id)]
 
 async def delete_task(task_id):
     pool = await get_db()
@@ -106,183 +100,316 @@ async def update_last_msg(task_id, msg_id):
     pool = await get_db()
     await pool.execute("UPDATE userbot_tasks SET last_msg_id = $1 WHERE task_id = $2", msg_id, task_id)
 
-# --- COMMANDS ---
+# --- BOT INTERFACE ---
 
-def is_auth(uid):
-    return uid in ADMIN_IDS
-
-@app.on_message(filters.command("manage"))
-async def cmd_manage(c, m):
-    if not is_auth(m.from_user.id): return
+@app.on_message(filters.command("manage") | filters.command("start"))
+async def start_cmd(c, m):
     uid = m.from_user.id
-    
     if await get_session(uid):
         await show_main_menu(m)
     else:
         await m.reply_text(
-            "👋 **Channel Manager Bot**\n\nI can schedule posts as YOU.\nPlease login first.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Login Account", callback_data="login_start")]])
+            "👋 **Manager Bot v2**\n\nI schedule posts for you.\nFirst, I need to log in to your account.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Login", callback_data="login_start")]])
         )
 
-# --- CALLBACKS ---
-
 @app.on_callback_query()
-async def callback_handler(client, query):
-    uid = query.from_user.id
-    if not is_auth(uid): return
-    d = query.data
+async def callback_router(c, q):
+    uid = q.from_user.id
+    d = q.data
 
+    # --- NAV ---
     if d == "menu_home":
         user_state[uid] = None
-        await show_main_menu(query.message)
-
+        await show_main_menu(q.message)
+    
+    # --- LOGIN ---
     elif d == "login_start":
         login_state[uid] = {"step": "waiting_phone"}
-        await query.message.edit_text("📱 **Send Phone Number**\nFormat: `+1234567890`")
-
-    elif d == "logout_confirm":
+        await q.message.edit_text("📱 **Send Phone Number**\nFormat: `+1234567890`")
+    
+    elif d == "logout":
         await del_session(uid)
-        await query.message.edit_text("✅ Logged out.")
+        await q.message.edit_text("👋 Logged out.")
 
+    # --- CHANNELS ---
+    elif d == "list_channels":
+        await show_channels(uid, q.message)
+    
     elif d == "add_channel":
         user_state[uid] = {"step": "waiting_forward"}
-        await query.message.edit_text("📝 **Forward a Message** from the channel to me now.")
+        await q.message.edit_text("📝 **Forward a message** from your channel to me now.")
+    
+    elif d.startswith("ch_"):
+        cid = d.split("ch_")[1]
+        await show_channel_options(uid, q.message, cid)
+    
+    elif d.startswith("rem_"):
+        cid = d.split("rem_")[1]
+        await del_channel(uid, cid)
+        await q.answer("Removed!")
+        await show_channels(uid, q.message)
 
-    elif d == "list_channels":
-        await show_channels_list(uid, query.message)
+    # --- POSTING ---
+    elif d.startswith("new_"):
+        cid = d.split("new_")[1]
+        user_state[uid] = {"step": "waiting_content", "target": cid}
+        await q.message.edit_text("1️⃣ **Send the Post**\n(Text, Photo, Video, or Sticker)")
 
-    elif d.startswith("manage_ch_"):
-        c_id = d.split("manage_ch_")[1]
-        await show_channel_dashboard(uid, query.message, c_id)
-
-    elif d.startswith("rem_ch_"):
-        c_id = d.split("rem_ch_")[1]
-        await del_channel_db(uid, c_id)
-        await query.answer("Removed.")
-        await show_channels_list(uid, query.message)
-
-    elif d.startswith("new_post_"):
-        c_id = d.split("new_post_")[1]
-        user_state[uid] = {"step": "waiting_content", "target_channel": c_id}
-        await query.message.edit_text("1️⃣ **Send Content**\n(Text, Photo, Video, etc.)")
-
-    elif d == "date_now":
-        user_state[uid]["start_time"] = datetime.datetime.now(IST) + datetime.timedelta(seconds=10) # Buffer
-        await ask_repetition(query.message, uid)
-
-    elif d == "repeat_none":
-        user_state[uid]["interval"] = None
-        await send_confirm_panel(query.message, uid)
-
-    elif d in ["toggle_pin", "toggle_del"]:
-        key = "pin" if "pin" in d else "del"
-        user_state[uid][key] = not user_state[uid].get(key, False)
-        await send_confirm_panel(query.message, uid)
-
-    elif d == "confirm_schedule":
-        st = user_state[uid]
-        t_id = f"task_{int(datetime.datetime.now().timestamp())}"
+    # --- EASY SCHEDULER ---
+    elif d.startswith("time_"):
+        # Calculate time based on button
+        offset = d.split("time_")[1] # "0", "10", "60", "1440"
         
-        task_data = {
-            "task_id": t_id,
-            "owner_id": uid,
-            "chat_id": st["target_channel"],
-            "msg_id": st["msg_id"],
-            "source_chat": query.message.chat.id,
-            "pin": st.get("pin", False),
-            "delete_old": st.get("del", False),
-            "repeat_interval": st.get("interval"),
-            "start_time": st["start_time"].isoformat(),
-            "last_msg_id": None
-        }
+        now = datetime.datetime.now(IST)
+        if offset == "0":
+            run_time = now + datetime.timedelta(seconds=5) # 5s buffer
+        else:
+            run_time = now + datetime.timedelta(minutes=int(offset))
         
-        await save_task(task_data)
-        add_job(t_id, task_data)
-        user_state[uid] = None
-        await query.message.edit_text("✅ **Task Scheduled!**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu", callback_data="menu_home")]]))
+        user_state[uid]["start_time"] = run_time
+        await ask_repetition(q.message, uid)
 
-    elif d.startswith("view_tasks_"):
-        c_id = d.split("view_tasks_")[1]
-        await show_active_tasks(uid, query.message, c_id)
+    elif d.startswith("rep_"):
+        val = d.split("rep_")[1] # "0", "60", "1440"
+        interval = None
+        if val != "0":
+            interval = f"minutes={val}"
+        
+        user_state[uid]["interval"] = interval
+        await confirm_task(q.message, uid)
 
+    # --- CONFIRM & SAVE ---
+    elif d == "save_task":
+        await create_task_logic(uid, q)
+
+    # --- TASK MANAGE ---
+    elif d.startswith("tasks_"):
+        cid = d.split("tasks_")[1]
+        await list_active_tasks(uid, q.message, cid)
+    
     elif d.startswith("del_task_"):
-        t_id = d.split("del_task_")[1]
-        try: scheduler.remove_job(t_id)
+        tid = d.split("del_task_")[1]
+        try: scheduler.remove_job(tid)
         except: pass
-        await delete_task(t_id)
-        await query.answer("Deleted")
-        await show_main_menu(query.message)
+        await delete_task(tid)
+        await q.answer("Task deleted")
+        await show_main_menu(q.message)
 
-# --- MESSAGES ---
+# --- MESSAGES & INPUTS ---
 
-@app.on_message(filters.private & ~filters.command("manage"))
-async def message_handler(client, message):
-    uid = message.from_user.id
-    if not is_auth(uid): return
-    text = message.text
+@app.on_message(filters.private & ~filters.command("manage") & ~filters.command("start"))
+async def handle_inputs(c, m):
+    uid = m.from_user.id
+    text = m.text or ""
 
     # Login Logic
     if uid in login_state:
-        await handle_login(client, message, uid)
+        await process_login(c, m, uid)
         return
 
     st = user_state.get(uid, {})
     step = st.get("step")
 
     if step == "waiting_forward":
-        if message.forward_from_chat:
-            chat = message.forward_from_chat
-            await add_channel_db(uid, str(chat.id), chat.title)
+        if m.forward_from_chat:
+            chat = m.forward_from_chat
+            await add_channel(uid, str(chat.id), chat.title)
             user_state[uid] = None
-            await message.reply(f"✅ Added: {chat.title}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Menu", callback_data="menu_home")]]))
+            await m.reply(f"✅ Added **{chat.title}**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu", callback_data="menu_home")]]))
         else:
-            await message.reply("⚠️ Please forward a message FROM the channel.")
+            await m.reply("❌ That's not a channel forward. Try again.")
 
     elif step == "waiting_content":
-        st["msg_id"] = message.id
-        st["step"] = "waiting_date"
-        user_state[uid] = st
-        await message.reply(
-            "2️⃣ **When to post?** (IST)\nFormat: `2026-02-05 14:30`\nOr click button:",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚡ Post Now", callback_data="date_now")]])
-        )
+        # Capture Content cleanly
+        content_type = "text"
+        file_id = None
+        content_text = m.text or m.caption or ""
 
-    elif step == "waiting_date":
-        try:
-            dt = datetime.datetime.strptime(text, "%Y-%m-%d %H:%M")
-            st["start_time"] = IST.localize(dt)
-            await ask_repetition(message, uid)
-        except:
-            await message.reply("❌ Invalid format.")
-
-    elif step == "waiting_repeat":
-        # Simple parser
-        val = None
-        if text:
-            if "min" in text: val = f"minutes={text.split()[0]}"
-            elif "hour" in text: val = f"hours={text.split()[0]}"
-            elif "day" in text: val = f"days={text.split()[0]}"
+        if m.photo:
+            content_type = "photo"
+            file_id = m.photo.file_id
+        elif m.video:
+            content_type = "video"
+            file_id = m.video.file_id
+        elif m.document:
+            content_type = "document"
+            file_id = m.document.file_id
         
-        if val:
-            st["interval"] = val
-            await send_confirm_panel(message, uid)
-        else:
-            await message.reply("❌ Use: `10 mins`, `2 hours`, `1 day`")
+        st.update({
+            "content_type": content_type,
+            "content_text": content_text,
+            "file_id": file_id,
+            "step": "waiting_time"
+        })
+        user_state[uid] = st
+        
+        # Easy Time Buttons
+        kb = [
+            [InlineKeyboardButton("🚀 Post Now", callback_data="time_0")],
+            [InlineKeyboardButton("⏱️ +10 Mins", callback_data="time_10"), InlineKeyboardButton("🕐 +1 Hour", callback_data="time_60")],
+            [InlineKeyboardButton("🌙 +6 Hours", callback_data="time_360"), InlineKeyboardButton("📅 +24 Hours", callback_data="time_1440")]
+        ]
+        await m.reply("2️⃣ **When should I post this?**", reply_markup=InlineKeyboardMarkup(kb))
 
-# --- LOGIN HANDLER ---
-async def handle_login(client, message, uid):
+# --- PROCESS FUNCTIONS ---
+
+async def ask_repetition(m, uid):
+    # Easy Repeat Buttons
+    kb = [
+        [InlineKeyboardButton("🚫 No Repeat", callback_data="rep_0")],
+        [InlineKeyboardButton("🔁 Every 30 Mins", callback_data="rep_30"), InlineKeyboardButton("🔁 Hourly", callback_data="rep_60")],
+        [InlineKeyboardButton("🔁 Every 6 Hours", callback_data="rep_360"), InlineKeyboardButton("🔁 Daily", callback_data="rep_1440")]
+    ]
+    if isinstance(m, Message): await m.reply("3️⃣ **Should this repeat?**", reply_markup=InlineKeyboardMarkup(kb))
+    else: await m.edit_text("3️⃣ **Should this repeat?**", reply_markup=InlineKeyboardMarkup(kb))
+
+async def confirm_task(m, uid):
+    st = user_state[uid]
+    t_str = st["start_time"].strftime("%I:%M %p")
+    r_str = st["interval"] if st["interval"] else "Once"
+    
+    txt = (f"✅ **Ready?**\n\n"
+           f"📢 Type: `{st['content_type']}`\n"
+           f"🕒 Time: `{t_str}`\n"
+           f"🔄 Repeat: `{r_str}`")
+    
+    kb = [[InlineKeyboardButton("✅ Confirm & Schedule", callback_data="save_task")]]
+    await m.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
+
+async def create_task_logic(uid, q):
+    st = user_state[uid]
+    tid = f"task_{int(datetime.datetime.now().timestamp())}"
+    
+    task_data = {
+        "task_id": tid,
+        "owner_id": uid,
+        "chat_id": st["target"],
+        "content_type": st["content_type"],
+        "content_text": st["content_text"],
+        "file_id": st["file_id"],
+        "pin": True,       # Default ON
+        "delete_old": True, # Default ON
+        "repeat_interval": st["interval"],
+        "start_time": st["start_time"].isoformat(),
+        "last_msg_id": None
+    }
+    
+    await save_task(task_data)
+    add_scheduler_job(tid, task_data)
+    user_state[uid] = None
+    await q.message.edit_text("🎉 **Done!** Post scheduled.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu", callback_data="menu_home")]]))
+
+# --- MENUS ---
+async def show_main_menu(m):
+    kb = [[InlineKeyboardButton("📢 My Channels", callback_data="list_channels"), InlineKeyboardButton("➕ Connect Channel", callback_data="add_channel")],
+          [InlineKeyboardButton("🚪 Logout", callback_data="logout")]]
+    txt = "👋 **Manager Dashboard**\nManage your channels easily."
+    if isinstance(m, Message): await m.reply(txt, reply_markup=InlineKeyboardMarkup(kb))
+    else: await m.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
+
+async def show_channels(uid, m):
+    chs = await get_channels(uid)
+    if not chs:
+        await m.edit_text("❌ No channels connected.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Connect One", callback_data="add_channel")]]))
+        return
+    kb = []
+    for c in chs: kb.append([InlineKeyboardButton(c['title'], callback_data=f"ch_{c['channel_id']}")])
+    kb.append([InlineKeyboardButton("🔙 Back", callback_data="menu_home")])
+    await m.edit_text("👇 **Select a Channel:**", reply_markup=InlineKeyboardMarkup(kb))
+
+async def show_channel_options(uid, m, cid):
+    tasks = await get_user_tasks(uid, cid)
+    kb = [
+        [InlineKeyboardButton("✍️ Schedule Post", callback_data=f"new_{cid}")],
+        [InlineKeyboardButton(f"📅 View Active Tasks ({len(tasks)})", callback_data=f"tasks_{cid}")],
+        [InlineKeyboardButton("🗑 Unlink Channel", callback_data=f"rem_{cid}"), InlineKeyboardButton("🔙 Back", callback_data="list_channels")]
+    ]
+    await m.edit_text(f"⚙️ **Managing Channel**", reply_markup=InlineKeyboardMarkup(kb))
+
+async def list_active_tasks(uid, m, cid):
+    tasks = await get_user_tasks(uid, cid)
+    if not tasks:
+        await m.edit_text("✅ No active tasks.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"ch_{cid}")]]))
+        return
+    txt = "**Active Tasks:**\n"
+    kb = []
+    for t in tasks:
+        # Easy readable time
+        dt = datetime.datetime.fromisoformat(t["start_time"])
+        txt += f"• {t['content_type'].upper()} at {dt.strftime('%H:%M')} (Rep: {t['repeat_interval'] or 'No'})\n"
+        kb.append([InlineKeyboardButton("🗑 Delete Task", callback_data=f"del_task_{t['task_id']}")])
+    kb.append([InlineKeyboardButton("🔙 Back", callback_data=f"ch_{cid}")])
+    await m.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
+
+# --- WORKER (THE FIX) ---
+def add_scheduler_job(tid, t):
+    async def job_func():
+        try:
+            session = await get_session(t["owner_id"])
+            if not session: return # User logged out
+            
+            # Start User Client
+            async with Client(":memory:", api_id=API_ID, api_hash=API_HASH, session_string=session) as user:
+                target = int(t["chat_id"])
+                
+                # 1. Delete Old Message
+                if t["delete_old"] and t["last_msg_id"]:
+                    try: await user.delete_messages(target, int(t["last_msg_id"]))
+                    except: pass
+                
+                # 2. Send New Message (Direct Send, No Copy)
+                sent = None
+                caption = t["content_text"]
+                
+                if t["content_type"] == "text":
+                    sent = await user.send_message(target, t["content_text"])
+                elif t["content_type"] == "photo":
+                    sent = await user.send_photo(target, t["file_id"], caption=caption)
+                elif t["content_type"] == "video":
+                    sent = await user.send_video(target, t["file_id"], caption=caption)
+                elif t["content_type"] == "document":
+                    sent = await user.send_document(target, t["file_id"], caption=caption)
+                
+                if sent:
+                    # 3. Pin
+                    if t["pin"]:
+                        try: await sent.pin()
+                        except: pass
+                    # Update DB
+                    await update_last_msg(tid, sent.id)
+                    
+        except Exception as e:
+            logger.error(f"Worker Error {tid}: {e}")
+
+    # Scheduling Logic
+    dt = datetime.datetime.fromisoformat(t["start_time"])
+    trigger = None
+    
+    if t["repeat_interval"]:
+        # Parse "minutes=30"
+        k, v = t["repeat_interval"].split("=")
+        kw = {k: int(v)}
+        trigger = IntervalTrigger(start_date=dt, timezone=IST, **kw)
+    else:
+        trigger = DateTrigger(run_date=dt, timezone=IST)
+        
+    scheduler.add_job(job_func, trigger, id=tid, replace_existing=True)
+
+# --- LOGIN HELPERS ---
+async def process_login(c, m, uid):
     st = login_state[uid]
-    text = message.text
-
+    text = m.text.strip()
+    
     if st["step"] == "waiting_phone":
         try:
-            temp_client = Client(f":memory:", api_id=API_ID, api_hash=API_HASH)
-            await temp_client.connect()
-            sent = await temp_client.send_code(text)
-            st.update({"client": temp_client, "phone": text, "hash": sent.phone_code_hash, "step": "waiting_code"})
-            await message.reply("📩 **Code Sent!**\nSend as `12345` (No spaces)")
+            temp = Client(":memory:", api_id=API_ID, api_hash=API_HASH)
+            await temp.connect()
+            sent = await temp.send_code(text)
+            st.update({"client": temp, "phone": text, "hash": sent.phone_code_hash, "step": "waiting_code"})
+            await m.reply("📩 **Code sent!**\nSend it like: `12345`")
         except Exception as e:
-            await message.reply(f"❌ Error: {e}")
+            await m.reply(f"❌ Error: {e}")
 
     elif st["step"] == "waiting_code":
         try:
@@ -291,12 +418,12 @@ async def handle_login(client, message, uid):
             await save_session(uid, sess)
             await st["client"].disconnect()
             del login_state[uid]
-            await message.reply("✅ **Login Success!**")
+            await m.reply("✅ **Success!** You are logged in.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Start Managing", callback_data="menu_home")]]))
         except errors.SessionPasswordNeeded:
             st["step"] = "waiting_pass"
-            await message.reply("🔐 **Enter 2FA Password:**")
+            await m.reply("🔐 **2FA Password required:**")
         except Exception as e:
-            await message.reply(f"❌ Error: {e}")
+            await m.reply(f"❌ Error: {e}")
 
     elif st["step"] == "waiting_pass":
         try:
@@ -305,113 +432,18 @@ async def handle_login(client, message, uid):
             await save_session(uid, sess)
             await st["client"].disconnect()
             del login_state[uid]
-            await message.reply("✅ **Login Success!**")
+            await m.reply("✅ **Success!**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Start Managing", callback_data="menu_home")]]))
         except Exception as e:
-            await message.reply(f"❌ Error: {e}")
-
-# --- UI HELPERS ---
-async def show_main_menu(m):
-    kb = [[InlineKeyboardButton("📢 Channels", callback_data="list_channels"), InlineKeyboardButton("➕ Add", callback_data="add_channel")],
-          [InlineKeyboardButton("🚪 Logout", callback_data="logout_confirm")]]
-    txt = "🤖 **Manager Dashboard**"
-    if isinstance(m, Message): await m.reply(txt, reply_markup=InlineKeyboardMarkup(kb))
-    else: await m.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
-
-async def show_channels_list(uid, m):
-    chs = await get_channels(uid)
-    if not chs:
-        await m.edit_text("❌ No channels.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Add", callback_data="add_channel")]]))
-        return
-    kb = []
-    for c in chs: kb.append([InlineKeyboardButton(c['title'], callback_data=f"manage_ch_{c['channel_id']}")])
-    kb.append([InlineKeyboardButton("🔙 Back", callback_data="menu_home")])
-    await m.edit_text("Select Channel:", reply_markup=InlineKeyboardMarkup(kb))
-
-async def show_channel_dashboard(uid, m, c_id):
-    tasks = await get_tasks_by_channel(uid, c_id)
-    count = len(tasks)
-    kb = [
-        [InlineKeyboardButton("✨ New Post", callback_data=f"new_post_{c_id}"), InlineKeyboardButton(f"📋 Scheduled ({count})", callback_data=f"view_tasks_{c_id}")],
-        [InlineKeyboardButton("🗑 Remove", callback_data=f"rem_ch_{c_id}"), InlineKeyboardButton("🔙 Back", callback_data="list_channels")]
-    ]
-    await m.edit_text(f"⚙️ **Channel Manager**", reply_markup=InlineKeyboardMarkup(kb))
-
-async def ask_repetition(m, uid):
-    user_state[uid]["step"] = "waiting_repeat"
-    await m.edit_text("3️⃣ **Repetition?**\nType `1 day`, `2 hours` or click:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚫 One Time", callback_data="repeat_none")]]))
-
-async def send_confirm_panel(m, uid):
-    st = user_state[uid]
-    st.setdefault("pin", False)
-    st.setdefault("del", False)
-    kb = [[InlineKeyboardButton(f"📌 Pin: {st['pin']}", callback_data="toggle_pin"), InlineKeyboardButton(f"🗑 Del Old: {st['del']}", callback_data="toggle_del")],
-          [InlineKeyboardButton("✅ START", callback_data="confirm_schedule")]]
-    msg_txt = f"⚙️ **Confirm**\nTime: `{st['start_time']}`\nRepeat: `{st.get('interval', 'No')}`"
-    if isinstance(m, Message): await m.reply(msg_txt, reply_markup=InlineKeyboardMarkup(kb))
-    else: await m.edit_text(msg_txt, reply_markup=InlineKeyboardMarkup(kb))
-
-async def show_active_tasks(uid, m, c_id):
-    tasks = await get_tasks_by_channel(uid, c_id)
-    txt = "**Tasks:**\n"
-    kb = []
-    for t in tasks:
-        txt += f"• {t['start_time']} (Rep: {t['repeat_interval']})\n"
-        kb.append([InlineKeyboardButton("🛑 Stop", callback_data=f"del_task_{t['task_id']}")])
-    kb.append([InlineKeyboardButton("🔙 Back", callback_data=f"manage_ch_{c_id}")])
-    await m.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
-
-# --- WORKER ---
-def add_job(t_id, t):
-    async def job():
-        try:
-            # SAFETY: Connect only when needed, but using Async Context Manager
-            sess = await get_session(t["owner_id"])
-            if not sess: return
-            
-            async with Client(f":memory:", api_id=API_ID, api_hash=API_HASH, session_string=sess) as user:
-                # 1. Delete Old if needed
-                if t["delete_old"] and t["last_msg_id"]:
-                    try: await user.delete_messages(int(t["chat_id"]), int(t["last_msg_id"]))
-                    except: pass
-                
-                # 2. Copy Message (From Bot's chat to Channel)
-                me_bot = await app.get_me()
-                sent = await user.copy_message(
-                    chat_id=int(t["chat_id"]),
-                    from_chat_id=me_bot.username, 
-                    message_id=int(t["msg_id"])
-                )
-                
-                # 3. Pin
-                if t["pin"]:
-                    try: await sent.pin()
-                    except: pass
-                
-                await update_last_msg(t["task_id"], sent.id)
-                
-        except Exception as e:
-            logger.error(f"Job failed: {e}")
-
-    # Trigger Logic
-    dt = datetime.datetime.fromisoformat(t["start_time"])
-    if t["repeat_interval"]:
-        # Parse "minutes=10" -> kwarg
-        k, v = t["repeat_interval"].split("=")
-        kwargs = {k: int(v)}
-        trigger = IntervalTrigger(start_date=dt, timezone=IST, **kwargs)
-    else:
-        trigger = DateTrigger(run_date=dt, timezone=IST)
-        
-    scheduler.add_job(job, trigger, id=t_id, replace_existing=True)
+            await m.reply(f"❌ Error: {e}")
 
 # --- STARTUP ---
 async def main():
     await init_db()
-    # Load tasks on boot
-    all_tasks = await get_all_tasks()
-    for t in all_tasks:
-        add_job(t["task_id"], t)
-    
+    # Resume tasks
+    tasks = await get_all_tasks()
+    for t in tasks:
+        add_scheduler_job(t['task_id'], t)
+        
     scheduler.start()
     await app.start()
     await idle()
