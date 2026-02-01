@@ -1,5 +1,6 @@
 telethon
+python-telegram-bot
 apscheduler
 pytz
-cryptg
-hachoir
+sqlalchemy
+psycopg2-binary  # For PostgreSQL on Railway
