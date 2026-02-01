@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Any
 
 from pyrogram import Client, filters, idle, errors, enums
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message
+# REMOVED InputFile from imports to fix the crash
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.date import DateTrigger
@@ -143,6 +144,7 @@ class BotManager:
             self.add_job(k, v)
             
         self.scheduler.start()
+        print("✅ Bot Started Successfully")
         await idle()
         await self.app.stop()
 
@@ -159,12 +161,18 @@ async def cmd_manage(client: Client, message: Message):
     else:
         await show_main_menu(message)
 
+# ADDED: /start handler to ensure bot responds to start
+@manager.app.on_message(filters.command("start"))
+async def cmd_start(client: Client, message: Message):
+    if not manager.is_authorized(message.from_user.id): return
+    await message.reply_text("👋 **Channel Manager Online**\nType /manage to begin.")
+
 @manager.app.on_message(filters.command("export"))
 async def cmd_export(client: Client, message: Message):
     if not manager.is_authorized(message.from_user.id): return
     manager.save_db()
     if os.path.exists(DB_FILE):
-        # FIX: Removed InputFile wrapper, passing path directly
+        # FIXED: Removed InputFile, passing file path directly
         await message.reply_document(DB_FILE, caption="📁 **Database Export**")
     else:
         await message.reply("No database found.")
@@ -395,4 +403,5 @@ async def handle_schedule_logic(uid, query, d):
         await query.message.edit_text("✅ **Scheduled!**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu", callback_data="menu_home")]]))
 
 if __name__ == "__main__":
+    # Fixed execution loop to prevent RuntimeError
     asyncio.run(manager.boot_services())
