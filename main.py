@@ -215,6 +215,11 @@ class BotManager:
 # --- Instantiate Manager ---
 manager = BotManager()
 
+# --- DEBUG LOGGER (Add this right after manager = BotManager()) ---
+@manager.app.on_message(group=-1)
+async def debug_logger(client, message):
+    print(f"👀 DEBUG: Received message from {message.from_user.id}: {message.text}")
+
 # --- Utility Commands ---
 @manager.app.on_message(filters.command("id"))
 async def cmd_get_id(client: Client, message: Message):
