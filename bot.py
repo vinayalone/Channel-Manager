@@ -176,17 +176,51 @@ async def message_handler(event):
             except Exception as e:
                 await event.respond(f"❌ Login Failed: {e}")
 
+   # --- 2. ADD CHANNEL LOGIC ---
     elif post_data and post_data.get('state') == 'WAIT_CHANNEL_FWD':
+        chat_id = None
+        title = None
+
+        # Option A: Try getting info from the Forward Header
         if event.fwd_from:
-            chat_id = event.fwd_from.channel_id
-            full_chat_id = int(f"-100{chat_id}")
-            title = event.fwd_from.from_name or "Unknown Channel"
+            try:
+                chat_id = event.fwd_from.channel_id
+                title = event.fwd_from.from_name or "Unknown Channel"
+            except:
+                pass
+
+        # Option B: If Forward failed (Private Channel), try resolving the text as a Link/Username
+        if not chat_id:
+            try:
+                text = event.text.strip()
+                # Use the logged-in User Client to resolve the link/username
+                # This works better because the User Account can see private channels it has joined
+                user_client = login_states.get(user_id, {}).get('client') or await get_user_client(user_id)
+                
+                if user_client:
+                    entity = await user_client.get_entity(text)
+                    chat_id = entity.id
+                    title = hasattr(entity, 'title') and entity.title or "Channel"
+            except Exception as e:
+                logging.error(f"Error resolving channel: {e}")
+
+        # If we successfully found a Channel ID
+        if chat_id:
+            # Convert to standard ID format (-100 prefix)
+            full_chat_id = int(f"-100{chat_id}") if not str(chat_id).startswith("-100") else chat_id
             
             cursor.execute("INSERT INTO channels (user_id, channel_id, channel_title) VALUES (?, ?, ?)", 
                            (user_id, full_chat_id, title))
             conn.commit()
             del post_states[user_id]
-            await event.respond(f"✅ Channel **{title}** added!", buttons=[Button.inline("Back to Menu", b"menu_main")])
+            await event.respond(f"✅ Channel **{title}** added successfully!", buttons=[Button.inline("Back to Menu", b"menu_main")])
+        
+        else:
+            await event.respond(
+                "❌ **Could not detect the channel.**\n\n"
+                "1. If this is a **Private Channel**, forwarding often fails due to privacy.\n"
+                "2. Instead, please send the **Channel Link** (e.g., `https://t.me/c/123...`) or **Username** (e.g. `@mychannel`)."
+            )
 
     elif post_data and post_data.get('state') == 'WAIT_CONTENT':
         post_states[user_id]['content_msg'] = event
