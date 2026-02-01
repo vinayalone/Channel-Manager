@@ -21,7 +21,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ManagerBot")
 
 # --- INIT ---
-app = Client("manager_v3", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("manager_v4", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 scheduler = AsyncIOScheduler(timezone=IST)
 db_pool = None
 
@@ -41,7 +41,17 @@ async def init_db():
     async with pool.acquire() as conn:
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_sessions (user_id BIGINT PRIMARY KEY, session_string TEXT)''')
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_channels (user_id BIGINT, channel_id TEXT, title TEXT, PRIMARY KEY(user_id, channel_id))''')
-        # We ensure the table exists (Schema must match from previous step)
+        
+        # --- SMART FIX: AUTO-UPGRADE TABLE ---
+        try:
+            # Try to see if the new column 'content_type' exists
+            await conn.execute("SELECT content_type FROM userbot_tasks LIMIT 1")
+        except:
+            # If it fails, it means we have the OLD table. Delete it to allow upgrade.
+            print("⚠️ Old Database Schema detected. Upgrading Table...")
+            await conn.execute("DROP TABLE IF EXISTS userbot_tasks")
+        # -------------------------------------
+
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_tasks 
                           (task_id TEXT PRIMARY KEY, owner_id BIGINT, chat_id TEXT, 
                            content_type TEXT, content_text TEXT, file_id TEXT, 
@@ -84,6 +94,7 @@ async def save_task(t):
 
 async def get_all_tasks():
     pool = await get_db()
+    # Safely fetch rows
     return [dict(x) for x in await pool.fetch("SELECT * FROM userbot_tasks")]
 
 async def get_user_tasks(user_id, chat_id):
@@ -120,12 +131,10 @@ async def callback_router(c, q):
     uid = q.from_user.id
     d = q.data
 
-    # --- NAV ---
     if d == "menu_home":
         user_state[uid] = None
         await show_main_menu(q.message)
     
-    # --- LOGIN ---
     elif d == "login_start":
         login_state[uid] = {"step": "waiting_phone"}
         await q.message.edit_text("📱 **Send Phone Number**\nFormat: `+1234567890`")
@@ -134,7 +143,6 @@ async def callback_router(c, q):
         await del_session(uid)
         await q.message.edit_text("👋 Logged out.")
 
-    # --- CHANNELS ---
     elif d == "list_channels":
         await show_channels(uid, q.message)
     
@@ -152,25 +160,22 @@ async def callback_router(c, q):
         await q.answer("Removed!")
         await show_channels(uid, q.message)
 
-    # --- POSTING FLOW ---
     elif d.startswith("new_"):
         cid = d.split("new_")[1]
         user_state[uid] = {"step": "waiting_content", "target": cid}
         await q.message.edit_text("1️⃣ **Send the Post**\n(Text, Photo, Video, or Sticker)")
 
-    # --- TIME ---
     elif d.startswith("time_"):
         offset = d.split("time_")[1] 
         now = datetime.datetime.now(IST)
         if offset == "0":
-            run_time = now + datetime.timedelta(seconds=10) # 10s buffer for immediate
+            run_time = now + datetime.timedelta(seconds=10)
         else:
             run_time = now + datetime.timedelta(minutes=int(offset))
         
         user_state[uid]["start_time"] = run_time
         await ask_repetition(q.message, uid)
 
-    # --- REPETITION ---
     elif d.startswith("rep_"):
         val = d.split("rep_")[1]
         interval = None
@@ -178,29 +183,22 @@ async def callback_router(c, q):
             interval = f"minutes={val}"
         
         user_state[uid]["interval"] = interval
-        # NEW STEP: Ask Settings instead of confirming immediately
         await ask_settings(q.message, uid)
 
-    # --- SETTINGS TOGGLE ---
     elif d in ["toggle_pin", "toggle_del"]:
         st = user_state[uid]
-        # Initialize if missing
         st.setdefault("pin", True)
         st.setdefault("del", True)
-        
         if d == "toggle_pin": st["pin"] = not st["pin"]
         if d == "toggle_del": st["del"] = not st["del"]
-        
-        await ask_settings(q.message, uid) # Refresh panel
+        await ask_settings(q.message, uid)
 
     elif d == "goto_confirm":
         await confirm_task(q.message, uid)
 
-    # --- CONFIRM & SAVE ---
     elif d == "save_task":
         await create_task_logic(uid, q)
 
-    # --- TASK MANAGE ---
     elif d.startswith("tasks_"):
         cid = d.split("tasks_")[1]
         await list_active_tasks(uid, q.message, cid)
@@ -250,6 +248,9 @@ async def handle_inputs(c, m):
         elif m.document:
             content_type = "document"
             file_id = m.document.file_id
+        elif m.sticker:
+            content_type = "sticker"
+            file_id = m.sticker.file_id
         
         st.update({
             "content_type": content_type,
@@ -266,7 +267,52 @@ async def handle_inputs(c, m):
         ]
         await m.reply("2️⃣ **When should I post this?**", reply_markup=InlineKeyboardMarkup(kb))
 
-# --- NEW PROCESS FUNCTIONS ---
+# --- UI HELPERS ---
+
+async def show_main_menu(m):
+    kb = [[InlineKeyboardButton("📢 My Channels", callback_data="list_channels"), InlineKeyboardButton("➕ Connect Channel", callback_data="add_channel")],
+          [InlineKeyboardButton("🚪 Logout", callback_data="logout")]]
+    txt = "👋 **Manager Dashboard**\nManage your channels easily."
+    if isinstance(m, Message): await m.reply(txt, reply_markup=InlineKeyboardMarkup(kb))
+    else: await m.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
+
+async def show_channels(uid, m):
+    chs = await get_channels(uid)
+    if not chs:
+        await m.edit_text("❌ No channels connected.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Connect One", callback_data="add_channel")]]))
+        return
+    kb = []
+    for c in chs: kb.append([InlineKeyboardButton(c['title'], callback_data=f"ch_{c['channel_id']}")])
+    kb.append([InlineKeyboardButton("🔙 Back", callback_data="menu_home")])
+    await m.edit_text("👇 **Select a Channel:**", reply_markup=InlineKeyboardMarkup(kb))
+
+async def show_channel_options(uid, m, cid):
+    tasks = await get_user_tasks(uid, cid)
+    kb = [
+        [InlineKeyboardButton("✍️ Schedule Post", callback_data=f"new_{cid}")],
+        [InlineKeyboardButton(f"📅 View Active Tasks ({len(tasks)})", callback_data=f"tasks_{cid}")],
+        [InlineKeyboardButton("🗑 Unlink Channel", callback_data=f"rem_{cid}"), InlineKeyboardButton("🔙 Back", callback_data="list_channels")]
+    ]
+    await m.edit_text(f"⚙️ **Managing Channel**", reply_markup=InlineKeyboardMarkup(kb))
+
+async def list_active_tasks(uid, m, cid):
+    tasks = await get_user_tasks(uid, cid)
+    if not tasks:
+        await m.edit_text("✅ No active tasks.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"ch_{cid}")]]))
+        return
+    txt = "**Active Tasks:**\n"
+    kb = []
+    for t in tasks:
+        try:
+            dt = datetime.datetime.fromisoformat(t["start_time"])
+            time_str = dt.strftime('%H:%M')
+        except:
+            time_str = "Unknown"
+        
+        txt += f"• {t['content_type'].upper()} at {time_str} (Rep: {t['repeat_interval'] or 'No'})\n"
+        kb.append([InlineKeyboardButton("🗑 Delete Task", callback_data=f"del_task_{t['task_id']}")])
+    kb.append([InlineKeyboardButton("🔙 Back", callback_data=f"ch_{cid}")])
+    await m.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
 
 async def ask_repetition(m, uid):
     kb = [
@@ -280,7 +326,6 @@ async def ask_repetition(m, uid):
 
 async def ask_settings(m, uid):
     st = user_state[uid]
-    # Defaults
     st.setdefault("pin", True)
     st.setdefault("del", True)
     
@@ -334,7 +379,7 @@ async def create_task_logic(uid, q):
     user_state[uid] = None
     await q.message.edit_text("🎉 **Done!** Post scheduled.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu", callback_data="menu_home")]]))
 
-# --- WORKER (Updated for Reliability) ---
+# --- WORKER ---
 def add_scheduler_job(tid, t):
     async def job_func():
         try:
@@ -361,7 +406,9 @@ def add_scheduler_job(tid, t):
                     sent = await user.send_video(target, t["file_id"], caption=caption)
                 elif t["content_type"] == "document":
                     sent = await user.send_document(target, t["file_id"], caption=caption)
-                
+                elif t["content_type"] == "sticker":
+                    sent = await user.send_sticker(target, t["file_id"])
+
                 if sent:
                     if t["pin"]:
                         try: await sent.pin()
@@ -369,10 +416,9 @@ def add_scheduler_job(tid, t):
                     
                     await update_last_msg(tid, sent.id)
                     
-                    # 3. UPDATE NEXT RUN TIME (For List View Reliability)
+                    # 3. UPDATE NEXT RUN TIME
                     if t["repeat_interval"]:
                         now = datetime.datetime.now(IST)
-                        # Extract minutes from "minutes=60"
                         mins = int(t["repeat_interval"].split("=")[1])
                         next_run = now + datetime.timedelta(minutes=mins)
                         await update_next_run(tid, next_run.isoformat())
@@ -389,7 +435,6 @@ def add_scheduler_job(tid, t):
     else:
         trigger = DateTrigger(run_date=dt, timezone=IST)
         
-    # misfire_grace_time=None allows job to run even if server was off during the scheduled time
     scheduler.add_job(job_func, trigger, id=tid, replace_existing=True, misfire_grace_time=None)
 
 # --- LOGIN HELPERS ---
@@ -435,9 +480,12 @@ async def process_login(c, m, uid):
 # --- STARTUP ---
 async def main():
     await init_db()
-    tasks = await get_all_tasks()
-    for t in tasks:
-        add_scheduler_job(t['task_id'], t)
+    try:
+        tasks = await get_all_tasks()
+        for t in tasks:
+            add_scheduler_job(t['task_id'], t)
+    except Exception as e:
+        logger.error(f"Startup Logic Error: {e}")
         
     scheduler.start()
     await app.start()
