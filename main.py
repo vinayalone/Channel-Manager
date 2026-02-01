@@ -4,6 +4,8 @@ import logging
 import asyncio
 import datetime
 import pytz
+import copy
+import uuid
 from typing import Dict, Optional, Any
 
 from pyrogram import Client, filters, idle, errors
@@ -14,11 +16,11 @@ from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.date import DateTrigger
 
 # --- Configuration ---
-# Fallback to defaults or raise clear errors if Env vars are missing
 API_ID = os.environ.get("API_ID")
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
+# Fail fast if credentials missing
 if not API_ID or not API_HASH or not BOT_TOKEN:
     print("❌ Error: Missing API_ID, API_HASH, or BOT_TOKEN environment variables.")
     exit(1)
@@ -37,8 +39,12 @@ logging.basicConfig(
 DB_FILE = "data.json"
 DEFAULT_DATA = {"sessions": {}, "tasks": {}, "channels": {}}
 
-# --- Global State ---
-data = DEFAULT_DATA.copy()
+# --- Global State & Locks ---
+# FIX 1: Deepcopy to prevent reference corruption
+data = copy.deepcopy(DEFAULT_DATA)
+# FIX 10: Lock for thread-safe data writes
+data_lock = asyncio.Lock()
+
 login_state: Dict[int, Dict[str, Any]] = {}
 user_state: Dict[int, Dict[str, Any]] = {}
 
@@ -51,37 +57,40 @@ class BotManager:
             api_hash=API_HASH,
             bot_token=BOT_TOKEN
         )
-        # Grace time handles tasks missed while bot was restarting
         self.scheduler = AsyncIOScheduler(timezone=IST, job_defaults={'misfire_grace_time': 60})
 
-    def load_db(self) -> None:
-        if os.path.exists(DB_FILE):
-            try:
-                with open(DB_FILE, "r") as f:
-                    loaded = json.load(f)
-                    data.update(loaded)
-            except json.JSONDecodeError:
-                logging.error("Database corrupted. Starting fresh.")
-                data.update(DEFAULT_DATA)
+    async def load_db(self) -> None:
+        async with data_lock:
+            if os.path.exists(DB_FILE):
+                try:
+                    with open(DB_FILE, "r") as f:
+                        loaded = json.load(f)
+                        data.update(loaded)
+                except json.JSONDecodeError:
+                    logging.error("Database corrupted. Starting fresh.")
+                    data.update(copy.deepcopy(DEFAULT_DATA))
 
-    def save_db(self) -> None:
-        with open(DB_FILE, "w") as f:
-            json.dump(data, f, indent=4, default=str)
+    async def save_db(self) -> None:
+        async with data_lock:
+            with open(DB_FILE, "w") as f:
+                json.dump(data, f, indent=4, default=str)
 
+    # FIX 6: Strict Admin Validation
     def is_authorized(self, user_id: int) -> bool:
-        return not ADMIN_IDS or user_id in ADMIN_IDS
+        if not ADMIN_IDS:
+            return False # Fail closed if no admins defined
+        return user_id in ADMIN_IDS
 
     def get_user_client(self, user_id: int) -> Optional[Client]:
         session = data["sessions"].get(str(user_id))
         if not session:
             return None
-        # Use :memory: to avoid creating session files for worker threads
+        # FIX 2: Clean client flags (Removed :memory: redundant string, removed no_updates=True)
         return Client(
-            f":memory:",
+            name=None, # In-memory only
             api_id=API_ID,
             api_hash=API_HASH,
             session_string=session,
-            no_updates=True,
             in_memory=True
         )
 
@@ -111,7 +120,11 @@ class BotManager:
     def add_job(self, t_id: str, t: Dict[str, Any]) -> None:
         try:
             start_dt = datetime.datetime.fromisoformat(t["start_time_iso"])
+            # FIX 4: Ensure Timezone Awareness
+            if start_dt.tzinfo is None:
+                start_dt = IST.localize(start_dt)
         except Exception:
+            logging.error(f"Invalid Date Format for Task {t_id}")
             return
 
         async def worker():
@@ -122,7 +135,6 @@ class BotManager:
                     logging.warning(f"Task {t_id} skipped: No user client.")
                     return
 
-                # Async Context Manager prevents memory leaks
                 async with user_client as user:
                     # 1. Resolve Peer
                     try:
@@ -139,23 +151,28 @@ class BotManager:
                     
                     # 3. Fetch Original & Send
                     try:
-                        orig = await self.app.get_messages(t["source_chat"], t["msg_id"])
-                        if not orig or orig.empty:
-                            raise ValueError("Message deleted")
-                    except Exception:
+                        # FIX 3: Use USER client to fetch message (Access rights)
+                        orig = await user.get_messages(t["source_chat"], t["msg_id"])
+                        
+                        # FIX 11: Reliable empty check
+                        if orig is None or getattr(orig, "empty", False):
+                            raise ValueError("Message deleted or inaccessible")
+                    except Exception as e:
+                        logging.error(f"Source message error for {t_id}: {e}")
                         # Auto-remove broken tasks
-                        logging.error(f"Source message not found for {t_id}. Removing task.")
                         try:
                             self.scheduler.remove_job(t_id)
                         except Exception:
                             pass
-                        if t_id in data["tasks"]:
-                            del data["tasks"][t_id]
-                            self.save_db()
+                        async with data_lock:
+                            if t_id in data["tasks"]:
+                                del data["tasks"][t_id]
+                        await self.save_db()
                         return
 
                     sent = None
                     try:
+                        # FIX 12: Correct entities handling
                         if orig.text:
                             sent = await user.send_message(int(t["chat_id"]), orig.text, entities=orig.entities)
                         elif orig.photo:
@@ -173,8 +190,10 @@ class BotManager:
                                 await sent.pin()
                             except Exception:
                                 pass
-                        data["tasks"][t_id]["last_msg_id"] = sent.id
-                        self.save_db()
+                        
+                        async with data_lock:
+                            data["tasks"][t_id]["last_msg_id"] = sent.id
+                        await self.save_db()
 
             except Exception as e:
                 logging.error(f"Worker Critical Error: {e}")
@@ -183,7 +202,7 @@ class BotManager:
         self.scheduler.add_job(worker, trigger, id=t_id, replace_existing=True)
 
     async def boot_services(self) -> None:
-        self.load_db()
+        await self.load_db()
         await self.app.start()
         
         # Load tasks
@@ -192,8 +211,13 @@ class BotManager:
             
         self.scheduler.start()
         print("✅ Bot Started Successfully")
-        await idle()
-        await self.app.stop()
+        
+        # FIX 9: Graceful Shutdown
+        try:
+            await idle()
+        finally:
+            self.scheduler.shutdown(wait=False)
+            await self.app.stop()
 
 # --- Instantiate Manager ---
 manager = BotManager()
@@ -216,7 +240,7 @@ async def cmd_start(client: Client, message: Message):
 @manager.app.on_message(filters.command("export"))
 async def cmd_export(client: Client, message: Message):
     if not manager.is_authorized(message.from_user.id): return
-    manager.save_db()
+    await manager.save_db()
     if os.path.exists(DB_FILE):
         await message.reply_document(DB_FILE, caption="📁 **Database Export**")
     else:
@@ -227,13 +251,20 @@ async def cmd_import(client: Client, message: Message):
     if not manager.is_authorized(message.from_user.id) or message.document.file_name != "data.json": return
     file_path = await message.download()
     try:
-        with open(file_path, "r") as f:
-            data.update(json.load(f))
-        manager.save_db()
-        await message.reply_text("✅ **Imported Successfully!**")
-        # Reload tasks immediately
+        # FIX 8: Clear jobs before import to prevent memory leaks/duplicates
+        manager.scheduler.remove_all_jobs()
+        
+        async with data_lock:
+            with open(file_path, "r") as f:
+                data.update(json.load(f))
+        
+        await manager.save_db()
+        await message.reply_text("✅ **Imported & Reloading...**")
+        
+        # Reload tasks
         for k, v in data["tasks"].items():
             manager.add_job(k, v)
+            
     except Exception as e:
         await message.reply_text(f"❌ Error: {e}")
     if os.path.exists(file_path):
@@ -254,9 +285,10 @@ async def callback_handler(client: Client, query: CallbackQuery):
         await query.message.edit_text("⚠️ **Confirm Logout?**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔴 Yes", callback_data="logout_final"), InlineKeyboardButton("🔙 No", callback_data="menu_home")]]))
 
     elif d == "logout_final":
-        if str(uid) in data["sessions"]: 
-            del data["sessions"][str(uid)]
-            manager.save_db()
+        async with data_lock:
+            if str(uid) in data["sessions"]: 
+                del data["sessions"][str(uid)]
+        await manager.save_db()
         await query.message.edit_text("✅ **Logged Out.**")
 
     elif d == "add_channel":
@@ -271,15 +303,17 @@ async def callback_handler(client: Client, query: CallbackQuery):
 
     elif d.startswith("rem_ch_"):
         c_id = d.split("_")[2]
-        if str(uid) in data["channels"] and c_id in data["channels"][str(uid)]:
-            del data["channels"][str(uid)][c_id]
-            manager.save_db()
+        async with data_lock:
+            if str(uid) in data["channels"] and c_id in data["channels"][str(uid)]:
+                del data["channels"][str(uid)][c_id]
+        await manager.save_db()
         await query.answer("Removed")
         await show_channels_list(uid, query.message)
 
     elif d.startswith("new_post_"):
         c_id = d.split("_")[2]
-        user_state[uid] = {"step": "waiting_content", "target_channel": c_id}
+        # FIX 7: Store source chat implicitly as DM initially
+        user_state[uid] = {"step": "waiting_content", "target_channel": c_id, "source_chat": query.message.chat.id}
         await query.message.edit_text("1️⃣ **Content**\nSend Text/Photo/Video.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data=f"manage_ch_{c_id}")]]))
 
     elif d.startswith("view_tasks_"):
@@ -292,9 +326,10 @@ async def callback_handler(client: Client, query: CallbackQuery):
             manager.scheduler.remove_job(t_id)
         except Exception: 
             pass
-        if t_id in data["tasks"]:
-            del data["tasks"][t_id]
-            manager.save_db()
+        async with data_lock:
+            if t_id in data["tasks"]:
+                del data["tasks"][t_id]
+        await manager.save_db()
         await query.answer("Stopped")
         await show_active_tasks(uid, query.message, c_id)
 
@@ -322,16 +357,23 @@ async def message_handler(client: Client, message: Message):
     if step == "waiting_forward":
         if message.forward_from_chat:
             chat = message.forward_from_chat
-            if str(uid) not in data["channels"]: data["channels"][str(uid)] = {}
-            data["channels"][str(uid)][str(chat.id)] = chat.title
-            manager.save_db()
+            async with data_lock:
+                if str(uid) not in data["channels"]: data["channels"][str(uid)] = {}
+                data["channels"][str(uid)][str(chat.id)] = chat.title
+            await manager.save_db()
             user_state[uid] = None
             await message.reply(f"✅ **Added:** {chat.title}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="menu_home")]]))
         else:
             await message.reply("⚠️ Forward from a channel.")
 
     elif step == "waiting_content":
-        st.update({"msg_id": message.id, "step": "waiting_date"})
+        # Capture the message location (Current Chat ID and Message ID)
+        st.update({
+            "msg_id": message.id, 
+            "step": "waiting_date",
+            # FIX 7: Explicitly set source chat to where the message is NOW (User's DM)
+            "source_chat": message.chat.id
+        })
         await message.reply("2️⃣ **Time** (IST)\nType `YYYY-MM-DD HH:MM` or:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚡ Now", callback_data="date_now")]]))
 
     elif step == "waiting_date":
@@ -359,8 +401,8 @@ async def handle_login_input(client, message, uid):
     if st["step"] == "waiting_phone":
         phone = text.replace(" ", "")
         status = await message.reply("🔄 Connecting...")
-        # Use in_memory=True to prevent file creation issues during login
-        temp = Client(f"sess_{uid}", api_id=API_ID, api_hash=API_HASH, in_memory=True)
+        # FIX 2: Correct flags for temp login client
+        temp = Client(name=None, api_id=API_ID, api_hash=API_HASH, in_memory=True)
         await temp.connect()
         try:
             sent = await temp.send_code(phone)
@@ -374,8 +416,10 @@ async def handle_login_input(client, message, uid):
         code = text.lower().replace("aa", "").replace(" ", "")
         try:
             await st["client"].sign_in(st["phone"], st["hash"], code)
-            data["sessions"][str(uid)] = await st["client"].export_session_string()
-            manager.save_db()
+            session_str = await st["client"].export_session_string()
+            async with data_lock:
+                data["sessions"][str(uid)] = session_str
+            await manager.save_db()
             await st["client"].disconnect()
             del login_state[uid]
             await message.reply("✅ **Success!**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Menu", callback_data="menu_home")]]))
@@ -388,8 +432,10 @@ async def handle_login_input(client, message, uid):
     elif st["step"] == "waiting_pass":
         try:
             await st["client"].check_password(text)
-            data["sessions"][str(uid)] = await st["client"].export_session_string()
-            manager.save_db()
+            session_str = await st["client"].export_session_string()
+            async with data_lock:
+                data["sessions"][str(uid)] = session_str
+            await manager.save_db()
             await st["client"].disconnect()
             del login_state[uid]
             await message.reply("✅ **Success!**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Menu", callback_data="menu_home")]]))
@@ -421,6 +467,9 @@ async def show_active_tasks(uid, m, c_id):
     for tid, t in tasks.items():
         try:
             start_dt = datetime.datetime.fromisoformat(t["start_time_iso"])
+            # FIX 4: Ensure Aware Datetime for display
+            if start_dt.tzinfo is None: start_dt = IST.localize(start_dt)
+            
             nxt = manager.get_next_run_time(start_dt, t["repeat_interval"])
             txt += f"• Next: `{nxt}`\n"
             kb.append([InlineKeyboardButton("🛑 Stop", callback_data=f"del_task_{tid}")])
@@ -460,21 +509,26 @@ async def handle_schedule_logic(uid, query, d):
         st["del"] = not st["del"]
         await send_confirm_panel(query.message, uid, is_edit=True)
     elif d == "confirm_schedule":
-        tid = f"task_{int(datetime.datetime.now().timestamp())}"
+        # FIX 5: UUID for Task ID
+        tid = f"task_{uuid.uuid4().hex}"
         task = {
             "task_id": tid, 
             "owner_id": uid, 
             "chat_id": st["target_channel"], 
-            "msg_id": st["msg_id"], 
-            "source_chat": query.message.chat.id, 
+            "msg_id": st["msg_id"],
+            # FIX 7: Use stored source chat
+            "source_chat": st["source_chat"],
             "pin": st["pin"], 
             "delete_old": st["del"], 
             "repeat_interval": st.get("interval"), 
             "start_time_iso": st["start_time"].isoformat(), 
             "last_msg_id": None
         }
-        data["tasks"][tid] = task
-        manager.save_db()
+        
+        async with data_lock:
+            data["tasks"][tid] = task
+        
+        await manager.save_db()
         manager.add_job(tid, task)
         user_state[uid] = None
         await query.message.edit_text("✅ **Scheduled!**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu", callback_data="menu_home")]]))
