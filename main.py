@@ -16,12 +16,15 @@ API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
+# Force Timezone to Asia/Kolkata
 IST = pytz.timezone('Asia/Kolkata')
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ManagerBot")
 
 # --- INIT ---
-app = Client("manager_v4", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("manager_v5", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# Critical Fix: Ensure scheduler uses the correct event loop
 scheduler = AsyncIOScheduler(timezone=IST)
 db_pool = None
 
@@ -44,13 +47,10 @@ async def init_db():
         
         # --- SMART FIX: AUTO-UPGRADE TABLE ---
         try:
-            # Try to see if the new column 'content_type' exists
             await conn.execute("SELECT content_type FROM userbot_tasks LIMIT 1")
         except:
-            # If it fails, it means we have the OLD table. Delete it to allow upgrade.
-            print("⚠️ Old Database Schema detected. Upgrading Table...")
+            print("⚠️ Upgrading Database Schema...")
             await conn.execute("DROP TABLE IF EXISTS userbot_tasks")
-        # -------------------------------------
 
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_tasks 
                           (task_id TEXT PRIMARY KEY, owner_id BIGINT, chat_id TEXT, 
@@ -94,7 +94,6 @@ async def save_task(t):
 
 async def get_all_tasks():
     pool = await get_db()
-    # Safely fetch rows
     return [dict(x) for x in await pool.fetch("SELECT * FROM userbot_tasks")]
 
 async def get_user_tasks(user_id, chat_id):
@@ -122,7 +121,7 @@ async def start_cmd(c, m):
         await show_main_menu(m)
     else:
         await m.reply_text(
-            "👋 **Manager Bot v3**\n\nI schedule posts for you.\nFirst, I need to log in to your account.",
+            "👋 **Manager Bot v5**\n\nI schedule posts for you.\nFirst, I need to log in to your account.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Login", callback_data="login_start")]])
         )
 
@@ -168,8 +167,9 @@ async def callback_router(c, q):
     elif d.startswith("time_"):
         offset = d.split("time_")[1] 
         now = datetime.datetime.now(IST)
+        # Fix: Ensure seconds are zeroed out for cleaner scheduling
         if offset == "0":
-            run_time = now + datetime.timedelta(seconds=10)
+            run_time = now + datetime.timedelta(seconds=5)
         else:
             run_time = now + datetime.timedelta(minutes=int(offset))
         
@@ -267,7 +267,7 @@ async def handle_inputs(c, m):
         ]
         await m.reply("2️⃣ **When should I post this?**", reply_markup=InlineKeyboardMarkup(kb))
 
-# --- UI HELPERS ---
+# --- UI HELPERS (FIXED DATE DISPLAY) ---
 
 async def show_main_menu(m):
     kb = [[InlineKeyboardButton("📢 My Channels", callback_data="list_channels"), InlineKeyboardButton("➕ Connect Channel", callback_data="add_channel")],
@@ -303,14 +303,20 @@ async def list_active_tasks(uid, m, cid):
     txt = "**Active Tasks:**\n"
     kb = []
     for t in tasks:
+        # --- FIX: ROBUST DATE PARSING ---
         try:
+            # Parse the ISO string back to a datetime object
             dt = datetime.datetime.fromisoformat(t["start_time"])
-            time_str = dt.strftime('%H:%M')
-        except:
-            time_str = "Unknown"
+            # Format it nicely
+            time_str = dt.strftime('%d-%b %I:%M %p')
+        except Exception as e:
+            # Fallback if format is wrong
+            time_str = "Checking..."
+        # --------------------------------
         
-        txt += f"• {t['content_type'].upper()} at {time_str} (Rep: {t['repeat_interval'] or 'No'})\n"
+        txt += f"• {t['content_type'].upper()} at `{time_str}`\n(Rep: {t['repeat_interval'] or 'No'})\n"
         kb.append([InlineKeyboardButton("🗑 Delete Task", callback_data=f"del_task_{t['task_id']}")])
+    
     kb.append([InlineKeyboardButton("🔙 Back", callback_data=f"ch_{cid}")])
     await m.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
 
@@ -344,7 +350,7 @@ async def ask_settings(m, uid):
 
 async def confirm_task(m, uid):
     st = user_state[uid]
-    t_str = st["start_time"].strftime("%I:%M %p")
+    t_str = st["start_time"].strftime("%d-%b %I:%M %p")
     r_str = st["interval"] if st["interval"] else "Once"
     
     txt = (f"✅ **Ready?**\n\n"
@@ -379,13 +385,14 @@ async def create_task_logic(uid, q):
     user_state[uid] = None
     await q.message.edit_text("🎉 **Done!** Post scheduled.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu", callback_data="menu_home")]]))
 
-# --- WORKER ---
+# --- WORKER (FIXED SENDING LOGIC) ---
 def add_scheduler_job(tid, t):
     async def job_func():
         try:
             session = await get_session(t["owner_id"])
             if not session: return 
             
+            # Start a temporary client for this job
             async with Client(":memory:", api_id=API_ID, api_hash=API_HASH, session_string=session) as user:
                 target = int(t["chat_id"])
                 
@@ -398,16 +405,20 @@ def add_scheduler_job(tid, t):
                 sent = None
                 caption = t["content_text"]
                 
-                if t["content_type"] == "text":
-                    sent = await user.send_message(target, t["content_text"])
-                elif t["content_type"] == "photo":
-                    sent = await user.send_photo(target, t["file_id"], caption=caption)
-                elif t["content_type"] == "video":
-                    sent = await user.send_video(target, t["file_id"], caption=caption)
-                elif t["content_type"] == "document":
-                    sent = await user.send_document(target, t["file_id"], caption=caption)
-                elif t["content_type"] == "sticker":
-                    sent = await user.send_sticker(target, t["file_id"])
+                try:
+                    if t["content_type"] == "text":
+                        sent = await user.send_message(target, t["content_text"])
+                    elif t["content_type"] == "photo":
+                        sent = await user.send_photo(target, t["file_id"], caption=caption)
+                    elif t["content_type"] == "video":
+                        sent = await user.send_video(target, t["file_id"], caption=caption)
+                    elif t["content_type"] == "document":
+                        sent = await user.send_document(target, t["file_id"], caption=caption)
+                    elif t["content_type"] == "sticker":
+                        sent = await user.send_sticker(target, t["file_id"])
+                except Exception as send_err:
+                    logger.error(f"Failed to send: {send_err}")
+                    return # Stop if sending failed
 
                 if sent:
                     if t["pin"]:
@@ -416,7 +427,7 @@ def add_scheduler_job(tid, t):
                     
                     await update_last_msg(tid, sent.id)
                     
-                    # 3. UPDATE NEXT RUN TIME
+                    # 3. UPDATE NEXT RUN TIME (Database Update)
                     if t["repeat_interval"]:
                         now = datetime.datetime.now(IST)
                         mins = int(t["repeat_interval"].split("=")[1])
