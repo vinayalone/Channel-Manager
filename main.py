@@ -39,10 +39,16 @@ async def get_db():
 async def init_db():
     pool = await get_db()
     async with pool.acquire() as conn:
+        # Sessions & Channels are fine, keep them
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_sessions (user_id BIGINT PRIMARY KEY, session_string TEXT)''')
-        # channels: stores channel_id and title
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_channels (user_id BIGINT, channel_id TEXT, title TEXT, PRIMARY KEY(user_id, channel_id))''')
-        # tasks: stores content type and file_id instead of just msg_id
+        
+        # --- FIX START: RESET TASKS TABLE ---
+        # We delete the old table so the new schema (with image support) can be created
+        await conn.execute('''DROP TABLE IF EXISTS userbot_tasks''') 
+        # --- FIX END ---
+
+        # Now create the new table with correct columns
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_tasks 
                           (task_id TEXT PRIMARY KEY, owner_id BIGINT, chat_id TEXT, 
                            content_type TEXT, content_text TEXT, file_id TEXT, 
