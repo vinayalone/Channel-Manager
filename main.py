@@ -21,9 +21,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ManagerBot")
 
 # --- INIT ---
-app = Client("manager_ultra_final_v2", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("manager_final_v8", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# FIX #1: Define scheduler globally but initialize it inside main() to grab the CORRECT loop
+# ✅ FIX #1: Scheduler starts as None. We bind it LATER in main().
 scheduler = None 
 db_pool = None
 
@@ -44,8 +44,8 @@ async def init_db():
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_sessions (user_id BIGINT PRIMARY KEY, session_string TEXT)''')
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_channels (user_id BIGINT, channel_id TEXT, title TEXT, PRIMARY KEY(user_id, channel_id))''')
         
-        # New table for v3 to ensure clean slate
-        await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_tasks_v3 
+        # Using V5 table to ensure clean slate (no schema conflicts)
+        await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_tasks_v5
                           (task_id TEXT PRIMARY KEY, owner_id BIGINT, chat_id TEXT, 
                            content_type TEXT, content_text TEXT, file_id TEXT, 
                            pin BOOLEAN, delete_old BOOLEAN, 
@@ -80,7 +80,7 @@ async def del_channel(user_id, cid):
 async def save_task(t):
     pool = await get_db()
     await pool.execute("""
-        INSERT INTO userbot_tasks_v3 
+        INSERT INTO userbot_tasks_v5
         (task_id, owner_id, chat_id, content_type, content_text, file_id, pin, delete_old, repeat_interval, start_time, last_msg_id)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         ON CONFLICT (task_id) DO UPDATE SET last_msg_id = $11, start_time = $10
@@ -89,23 +89,23 @@ async def save_task(t):
 
 async def get_all_tasks():
     pool = await get_db()
-    return [dict(x) for x in await pool.fetch("SELECT * FROM userbot_tasks_v3")]
+    return [dict(x) for x in await pool.fetch("SELECT * FROM userbot_tasks_v5")]
 
 async def get_user_tasks(user_id, chat_id):
     pool = await get_db()
-    return [dict(x) for x in await pool.fetch("SELECT * FROM userbot_tasks_v3 WHERE owner_id = $1 AND chat_id = $2", user_id, chat_id)]
+    return [dict(x) for x in await pool.fetch("SELECT * FROM userbot_tasks_v5 WHERE owner_id = $1 AND chat_id = $2", user_id, chat_id)]
 
 async def delete_task(task_id):
     pool = await get_db()
-    await pool.execute("DELETE FROM userbot_tasks_v3 WHERE task_id = $1", task_id)
+    await pool.execute("DELETE FROM userbot_tasks_v5 WHERE task_id = $1", task_id)
 
 async def update_last_msg(task_id, msg_id):
     pool = await get_db()
-    await pool.execute("UPDATE userbot_tasks_v3 SET last_msg_id = $1 WHERE task_id = $2", msg_id, task_id)
+    await pool.execute("UPDATE userbot_tasks_v5 SET last_msg_id = $1 WHERE task_id = $2", msg_id, task_id)
 
 async def update_next_run(task_id, next_time_str):
     pool = await get_db()
-    await pool.execute("UPDATE userbot_tasks_v3 SET start_time = $1 WHERE task_id = $2", next_time_str, task_id)
+    await pool.execute("UPDATE userbot_tasks_v5 SET start_time = $1 WHERE task_id = $2", next_time_str, task_id)
 
 # --- BOT INTERFACE ---
 
@@ -116,7 +116,7 @@ async def start_cmd(c, m):
         await show_main_menu(m)
     else:
         await m.reply_text(
-            "👋 **Manager Bot V6 (Final)**\n\nI schedule posts for you.\nFirst, I need to log in to your account.",
+            "👋 **Manager Bot V8 (Final)**\n\nI schedule posts for you.\nFirst, I need to log in to your account.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Login", callback_data="login_start")]])
         )
 
@@ -167,7 +167,6 @@ async def callback_router(c, q):
             run_time = now + datetime.timedelta(seconds=5)
         else:
             run_time = now + datetime.timedelta(minutes=int(offset))
-            # Clean seconds
             run_time = run_time.replace(second=0, microsecond=0)
         
         user_state[uid]["start_time"] = run_time
@@ -380,14 +379,15 @@ async def create_task_logic(uid, q):
         logger.error(f"Save Task Error: {e}")
         await q.message.edit_text(f"❌ Error saving task: {e}")
 
-# --- WORKER (FIXED #1, #2, #3, #4) ---
+# --- WORKER ---
 def add_scheduler_job(tid, t):
+    # ✅ FIX #2: Check if scheduler is ready (it should be now)
+    if scheduler is None:
+        logger.error(f"❌ SCHEDULER IS NONE. Job {tid} skipped. Check initialization!")
+        return
+
     async def job_func():
-        # FIX #3: Log trigger to PROVE execution
         logger.info(f"🚀 JOB TRIGGERED: {tid} at {datetime.datetime.now(IST)}")
-        
-        # FIX #4: If task is way in the past, maybe warn but we let it run 
-        # (APScheduler might have missed it, better late than never usually)
         
         next_run_iso = None
         if t["repeat_interval"]:
@@ -407,8 +407,8 @@ def add_scheduler_job(tid, t):
             async with Client(":memory:", api_id=API_ID, api_hash=API_HASH, session_string=session) as user:
                 target = int(t["chat_id"])
                 
-                try:
-                    await user.get_dialogs(limit=50) # Refresh Access Hash
+                # Prevent Peer Id Invalid by caching access hash
+                try: await user.get_dialogs(limit=50)
                 except: pass
 
                 # 1. Delete Old Message
@@ -447,13 +447,12 @@ def add_scheduler_job(tid, t):
             logger.error(f"🔥 Job {tid} CRITICAL FAIL: {e}")
         
         finally:
-            # 3. ALWAYS UPDATE NEXT RUN TIME
+            # 3. UPDATE DB FOR NEXT RUN
             if next_run_iso:
                 try:
                     await update_next_run(tid, next_run_iso)
                     logger.info(f"🔄 Job {tid}: DB Updated for next run.")
-                except Exception as e:
-                    logger.error(f"DB Update Fail: {e}")
+                except: pass
 
     dt = datetime.datetime.fromisoformat(t["start_time"])
     trigger = None
@@ -464,7 +463,6 @@ def add_scheduler_job(tid, t):
     else:
         trigger = DateTrigger(run_date=dt, timezone=IST)
     
-    # FIX #2: Remove misfire_grace_time=None. Default is safe.
     scheduler.add_job(job_func, trigger, id=tid, replace_existing=True)
 
 # --- LOGIN HELPERS ---
@@ -507,13 +505,14 @@ async def process_login(c, m, uid):
         except Exception as e:
             await m.reply(f"❌ Error: {e}")
 
-# --- STARTUP (FIX #1) ---
+# --- STARTUP (FIX #3) ---
 async def main():
     await init_db()
     
-    # FIX #1: Bind Scheduler to the CURRENT Running Loop
+    # ✅ FIX #3: Initialize Scheduler WITH RUNNING LOOP
     global scheduler
     scheduler = AsyncIOScheduler(timezone=IST, event_loop=asyncio.get_running_loop())
+    scheduler.start()
     
     try:
         tasks = await get_all_tasks()
@@ -523,7 +522,6 @@ async def main():
     except Exception as e:
         logger.error(f"Startup Logic Error: {e}")
         
-    scheduler.start()
     await app.start()
     await idle()
     await app.stop()
