@@ -128,6 +128,7 @@ async def callback_handler(client, query):
         await handle_schedule_toggles(uid, query, d)
 
 # --- Message Handler (Login & Content) ---
+# --- Message Handler (Login & Content) ---
 @app.on_message(filters.private)
 async def message_handler(client, message):
     uid = message.from_user.id
@@ -143,7 +144,6 @@ async def message_handler(client, message):
             phone = text.replace(" ", "")
             status_msg = await message.reply("🔄 Sending Login Code...")
             
-            # Create a temp client to connect
             temp_client = Client(f"session_{uid}", api_id=API_ID, api_hash=API_HASH)
             await temp_client.connect()
             
@@ -153,8 +153,13 @@ async def message_handler(client, message):
                 st["phone"] = phone
                 st["phone_hash"] = sent_code.phone_code_hash
                 st["step"] = "waiting_code"
+                
+                # IMPORTANT: Instructions for the "aa" trick
                 await status_msg.edit_text(
-                    "📩 **Code Sent!**\n\nCheck your Telegram messages.\nEnter the code like this: `1 2 3 4 5` (add spaces between numbers!) or just `12345`."
+                    "📩 **Code Sent!**\n\n"
+                    "⚠️ **To prevent Telegram from expiring the code:**\n"
+                    "Please add `aa` before the code.\n\n"
+                    "Example: If code is `12345`, send: **`aa12345`**"
                 )
             except Exception as e:
                 await temp_client.disconnect()
@@ -163,39 +168,66 @@ async def message_handler(client, message):
 
         # Step B: Code Received -> Sign In
         elif st["step"] == "waiting_code":
-            code = text.replace(" ", "")
+            # CLEANUP: Remove 'aa' or any non-digit characters
+            # This turns "aa12345", "aa 12345", "code 12345" -> "12345"
+            raw_text = text.lower().replace("aa", "").replace(" ", "")
+            code = "".join([c for c in raw_text if c.isdigit()])
+
+            if not code:
+                await message.reply("⚠️ invalid format. Please send like **`aa12345`**.")
+                return
+
             temp_client = st["client"]
             
             try:
+                await message.reply("🔄 Verifying code...")
                 await temp_client.sign_in(st["phone"], st["phone_hash"], code)
-                # Success!
+                
+                # If we get here, Login is SUCCESS (No 2FA)
                 string = await temp_client.export_session_string()
                 data["sessions"][str(uid)] = string
                 save_db()
                 await temp_client.disconnect()
                 del login_state[uid]
-                await message.reply("✅ **Login Successful!**\nType /manage to start.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Open Menu", callback_data="menu_home")]]))
+                
+                await message.reply("✅ **Login Successful!**\nType /manage to start.", 
+                                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Open Menu", callback_data="menu_home")]]))
             
             except errors.SessionPasswordNeeded:
+                # 2FA DETECTED!
                 st["step"] = "waiting_password"
-                await message.reply("🔐 **2FA Password Required**\nPlease enter your Two-Step Verification password.")
+                await message.reply("🔐 **Two-Step Verification Detected**\n\nPlease enter your Telegram Cloud Password.")
             
+            except errors.PhoneCodeExpired:
+                 await message.reply("❌ **Code Expired.**\nTelegram deleted the code. Please try logging in again.")
+                 await temp_client.disconnect()
+                 del login_state[uid]
+
             except Exception as e:
                 await message.reply(f"❌ Error: {e}")
 
-        # Step C: 2FA Password
+        # Step C: 2FA Password Received (If needed)
         elif st["step"] == "waiting_password":
             temp_client = st["client"]
+            password = text # The user's password
+            
             try:
-                await temp_client.check_password(text)
+                await message.reply("🔄 Checking Password...")
+                await temp_client.check_password(password)
+                
+                # Login SUCCESS (After 2FA)
                 string = await temp_client.export_session_string()
                 data["sessions"][str(uid)] = string
                 save_db()
                 await temp_client.disconnect()
                 del login_state[uid]
-                await message.reply("✅ **Login Successful!**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Open Menu", callback_data="menu_home")]]))
+                
+                await message.reply("✅ **Login Successful!**\nType /manage to start.", 
+                                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Open Menu", callback_data="menu_home")]]))
+            except errors.PasswordHashInvalid:
+                 await message.reply("❌ **Wrong Password.** Please try again.")
             except Exception as e:
-                await message.reply(f"❌ Password Error: {e}")
+                await message.reply(f"❌ Error: {e}")
 
     # 2. MAIN MENU COMMAND
     elif text == "/manage":
