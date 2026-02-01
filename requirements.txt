@@ -1,6 +1,4 @@
-telethon
-python-telegram-bot
+pyrogram
+tgcrypto
 apscheduler
-pytz
-sqlalchemy
-psycopg2-binary  # For PostgreSQL on Railway
+asyncpg
