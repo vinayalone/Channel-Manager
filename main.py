@@ -250,7 +250,8 @@ async def show_main_menu(m):
 async def show_channels_list(uid, m):
     user_chs = data["channels"].get(str(uid), {})
     if not user_chs:
-        await m.edit_text("ℹ️ **No Channels**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Add Channel", callback_data="add_channel"), InlineKeyboardButton("🔙 Back", callback_data="menu_home")]])
+        # FIXED SYNTAX ERROR HERE (Added Closing Parenthesis)
+        await m.edit_text("ℹ️ **No Channels**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Add Channel", callback_data="add_channel"), InlineKeyboardButton("🔙 Back", callback_data="menu_home")]]))
         return
     kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"📢 {t}", callback_data=f"manage_ch_{c}")] for c, t in user_chs.items()] + [[InlineKeyboardButton("🔙 Back", callback_data="menu_home")]])
     await m.edit_text("**Select Channel:**", reply_markup=kb)
@@ -278,7 +279,6 @@ async def show_active_tasks(uid, m, c_id):
             txt += f"• Next: `{nxt}`\n"
             kb.append([InlineKeyboardButton(f"🛑 Stop Task", callback_data=f"del_task_{tid}")])
         except Exception as e:
-            # Corrupt task, remove logic could go here
             continue
 
     kb.append([InlineKeyboardButton("🔙 Back", callback_data=f"manage_ch_{c_id}")])
