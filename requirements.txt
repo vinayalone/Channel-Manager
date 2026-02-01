@@ -1,4 +1,5 @@
-Pyrogram
-TgCrypto
+telethon
 apscheduler
 pytz
+cryptg
+hachoir
