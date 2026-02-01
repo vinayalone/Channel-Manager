@@ -20,7 +20,6 @@ API_ID = os.environ.get("API_ID")
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-# Fail fast if credentials missing
 if not API_ID or not API_HASH or not BOT_TOKEN:
     print("❌ Error: Missing API_ID, API_HASH, or BOT_TOKEN environment variables.")
     exit(1)
@@ -40,9 +39,7 @@ DB_FILE = "data.json"
 DEFAULT_DATA = {"sessions": {}, "tasks": {}, "channels": {}}
 
 # --- Global State & Locks ---
-# FIX 1: Deepcopy to prevent reference corruption
 data = copy.deepcopy(DEFAULT_DATA)
-# FIX 10: Lock for thread-safe data writes
 data_lock = asyncio.Lock()
 
 login_state: Dict[int, Dict[str, Any]] = {}
@@ -75,19 +72,17 @@ class BotManager:
             with open(DB_FILE, "w") as f:
                 json.dump(data, f, indent=4, default=str)
 
-    # FIX 6: Strict Admin Validation
     def is_authorized(self, user_id: int) -> bool:
         if not ADMIN_IDS:
-            return False # Fail closed if no admins defined
+            return False 
         return user_id in ADMIN_IDS
 
     def get_user_client(self, user_id: int) -> Optional[Client]:
         session = data["sessions"].get(str(user_id))
         if not session:
             return None
-        # FIX 2: Clean client flags (Removed :memory: redundant string, removed no_updates=True)
         return Client(
-            name=None, # In-memory only
+            name=None,
             api_id=API_ID,
             api_hash=API_HASH,
             session_string=session,
@@ -120,7 +115,6 @@ class BotManager:
     def add_job(self, t_id: str, t: Dict[str, Any]) -> None:
         try:
             start_dt = datetime.datetime.fromisoformat(t["start_time_iso"])
-            # FIX 4: Ensure Timezone Awareness
             if start_dt.tzinfo is None:
                 start_dt = IST.localize(start_dt)
         except Exception:
@@ -136,30 +130,23 @@ class BotManager:
                     return
 
                 async with user_client as user:
-                    # 1. Resolve Peer
                     try:
                         await user.get_chat(int(t["chat_id"]))
                     except Exception as e:
                         logging.warning(f"Could not resolve target chat: {e}")
 
-                    # 2. Delete Old
                     if t.get("delete_old") and t.get("last_msg_id"):
                         try:
                             await user.delete_messages(int(t["chat_id"]), t["last_msg_id"])
                         except Exception:
                             pass
                     
-                    # 3. Fetch Original & Send
                     try:
-                        # FIX 3: Use USER client to fetch message (Access rights)
                         orig = await user.get_messages(t["source_chat"], t["msg_id"])
-                        
-                        # FIX 11: Reliable empty check
                         if orig is None or getattr(orig, "empty", False):
                             raise ValueError("Message deleted or inaccessible")
                     except Exception as e:
                         logging.error(f"Source message error for {t_id}: {e}")
-                        # Auto-remove broken tasks
                         try:
                             self.scheduler.remove_job(t_id)
                         except Exception:
@@ -172,7 +159,6 @@ class BotManager:
 
                     sent = None
                     try:
-                        # FIX 12: Correct entities handling
                         if orig.text:
                             sent = await user.send_message(int(t["chat_id"]), orig.text, entities=orig.entities)
                         elif orig.photo:
@@ -205,14 +191,21 @@ class BotManager:
         await self.load_db()
         await self.app.start()
         
+        # --- DEBUG LOGGING ---
+        print("---------------------------------------")
+        print(f"✅ Bot Started.")
+        print(f"🔒 ADMIN_IDS Loaded: {ADMIN_IDS}")
+        if not ADMIN_IDS:
+            print("⚠️ WARNING: No ADMIN_IDS set! All commands will be rejected.")
+            print("ℹ️ Send /id to the bot to get your numeric ID.")
+        print("---------------------------------------")
+
         # Load tasks
         for k, v in data["tasks"].items():
             self.add_job(k, v)
             
         self.scheduler.start()
-        print("✅ Bot Started Successfully")
         
-        # FIX 9: Graceful Shutdown
         try:
             await idle()
         finally:
@@ -222,10 +215,18 @@ class BotManager:
 # --- Instantiate Manager ---
 manager = BotManager()
 
-# --- Commands ---
+# --- Utility Commands ---
+@manager.app.on_message(filters.command("id"))
+async def cmd_get_id(client: Client, message: Message):
+    # This command is OPEN to everyone so you can find your ID
+    await message.reply(f"🆔 **Your User ID:** `{message.from_user.id}`\n\nAdd this to your `ADMIN_IDS` environment variable.")
+
+# --- Main Commands ---
 @manager.app.on_message(filters.command("manage"))
 async def cmd_manage(client: Client, message: Message):
-    if not manager.is_authorized(message.from_user.id): return
+    if not manager.is_authorized(message.from_user.id): 
+        return await message.reply("⛔ **Unauthorized.**\nYou are not in the `ADMIN_IDS` list.")
+    
     uid = str(message.from_user.id)
     if uid not in data["sessions"]:
         await message.reply_text("👋 **Welcome!**\nPlease log in.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Connect Account", callback_data="login_start")]]))
@@ -234,12 +235,14 @@ async def cmd_manage(client: Client, message: Message):
 
 @manager.app.on_message(filters.command("start"))
 async def cmd_start(client: Client, message: Message):
-    if not manager.is_authorized(message.from_user.id): return
+    if not manager.is_authorized(message.from_user.id): 
+        return await message.reply("⛔ **Unauthorized.**\nYou are not in the `ADMIN_IDS` list.")
     await message.reply_text("👋 **Channel Manager Online**\nType /manage to begin.")
 
 @manager.app.on_message(filters.command("export"))
 async def cmd_export(client: Client, message: Message):
-    if not manager.is_authorized(message.from_user.id): return
+    if not manager.is_authorized(message.from_user.id): 
+        return await message.reply("⛔ **Unauthorized.**")
     await manager.save_db()
     if os.path.exists(DB_FILE):
         await message.reply_document(DB_FILE, caption="📁 **Database Export**")
@@ -248,12 +251,14 @@ async def cmd_export(client: Client, message: Message):
 
 @manager.app.on_message(filters.document & filters.private)
 async def cmd_import(client: Client, message: Message):
-    if not manager.is_authorized(message.from_user.id) or message.document.file_name != "data.json": return
+    if not manager.is_authorized(message.from_user.id):
+        # Silent ignore for random file uploads from strangers
+        return
+    if message.document.file_name != "data.json": return
+    
     file_path = await message.download()
     try:
-        # FIX 8: Clear jobs before import to prevent memory leaks/duplicates
         manager.scheduler.remove_all_jobs()
-        
         async with data_lock:
             with open(file_path, "r") as f:
                 data.update(json.load(f))
@@ -261,7 +266,6 @@ async def cmd_import(client: Client, message: Message):
         await manager.save_db()
         await message.reply_text("✅ **Imported & Reloading...**")
         
-        # Reload tasks
         for k, v in data["tasks"].items():
             manager.add_job(k, v)
             
@@ -274,7 +278,9 @@ async def cmd_import(client: Client, message: Message):
 @manager.app.on_callback_query()
 async def callback_handler(client: Client, query: CallbackQuery):
     uid = query.from_user.id
-    if not manager.is_authorized(uid): return
+    if not manager.is_authorized(uid): 
+        return await query.answer("⛔ Unauthorized", show_alert=True)
+    
     d = query.data
 
     if d == "menu_home":
@@ -312,7 +318,6 @@ async def callback_handler(client: Client, query: CallbackQuery):
 
     elif d.startswith("new_post_"):
         c_id = d.split("_")[2]
-        # FIX 7: Store source chat implicitly as DM initially
         user_state[uid] = {"step": "waiting_content", "target_channel": c_id, "source_chat": query.message.chat.id}
         await query.message.edit_text("1️⃣ **Content**\nSend Text/Photo/Video.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data=f"manage_ch_{c_id}")]]))
 
@@ -367,11 +372,9 @@ async def message_handler(client: Client, message: Message):
             await message.reply("⚠️ Forward from a channel.")
 
     elif step == "waiting_content":
-        # Capture the message location (Current Chat ID and Message ID)
         st.update({
             "msg_id": message.id, 
             "step": "waiting_date",
-            # FIX 7: Explicitly set source chat to where the message is NOW (User's DM)
             "source_chat": message.chat.id
         })
         await message.reply("2️⃣ **Time** (IST)\nType `YYYY-MM-DD HH:MM` or:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚡ Now", callback_data="date_now")]]))
@@ -401,7 +404,6 @@ async def handle_login_input(client, message, uid):
     if st["step"] == "waiting_phone":
         phone = text.replace(" ", "")
         status = await message.reply("🔄 Connecting...")
-        # FIX 2: Correct flags for temp login client
         temp = Client(name=None, api_id=API_ID, api_hash=API_HASH, in_memory=True)
         await temp.connect()
         try:
@@ -467,9 +469,7 @@ async def show_active_tasks(uid, m, c_id):
     for tid, t in tasks.items():
         try:
             start_dt = datetime.datetime.fromisoformat(t["start_time_iso"])
-            # FIX 4: Ensure Aware Datetime for display
             if start_dt.tzinfo is None: start_dt = IST.localize(start_dt)
-            
             nxt = manager.get_next_run_time(start_dt, t["repeat_interval"])
             txt += f"• Next: `{nxt}`\n"
             kb.append([InlineKeyboardButton("🛑 Stop", callback_data=f"del_task_{tid}")])
@@ -509,14 +509,12 @@ async def handle_schedule_logic(uid, query, d):
         st["del"] = not st["del"]
         await send_confirm_panel(query.message, uid, is_edit=True)
     elif d == "confirm_schedule":
-        # FIX 5: UUID for Task ID
         tid = f"task_{uuid.uuid4().hex}"
         task = {
             "task_id": tid, 
             "owner_id": uid, 
             "chat_id": st["target_channel"], 
             "msg_id": st["msg_id"],
-            # FIX 7: Use stored source chat
             "source_chat": st["source_chat"],
             "pin": st["pin"], 
             "delete_old": st["del"], 
