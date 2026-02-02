@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ManagerBot")
 
 # --- INIT ---
-app = Client("manager_poll_v15", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("manager_ui_v16", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 scheduler = None 
 db_pool = None
 
@@ -91,9 +91,13 @@ async def get_user_tasks(user_id, chat_id):
     pool = await get_db()
     return [dict(x) for x in await pool.fetch("SELECT * FROM userbot_tasks_v7 WHERE owner_id = $1 AND chat_id = $2", user_id, chat_id)]
 
+# ✅ UPDATED: Now returns the chat_id so we can refresh the list
 async def delete_task(task_id):
     pool = await get_db()
+    # Fetch chat_id before deleting
+    row = await pool.fetchrow("SELECT chat_id FROM userbot_tasks_v7 WHERE task_id = $1", task_id)
     await pool.execute("DELETE FROM userbot_tasks_v7 WHERE task_id = $1", task_id)
+    return row['chat_id'] if row else None
 
 async def update_last_msg(task_id, msg_id):
     pool = await get_db()
@@ -147,7 +151,7 @@ async def start_cmd(c, m):
         await show_main_menu(m)
     else:
         await m.reply_text(
-            "👋 **Manager Bot V15 (Polls + Clean UI)**\n\nPlease login to start.",
+            "👋 **Manager Bot V16**\n\nPlease login to start.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Login", callback_data="login_start")]])
         )
 
@@ -188,7 +192,6 @@ async def callback_router(c, q):
 
     elif d.startswith("new_"):
         cid = d.split("new_")[1]
-        # Store the Menu Message ID to update it later
         st = {"step": "waiting_content", "target": cid, "menu_msg_id": q.message.id}
         user_state[uid] = st
         await q.message.edit_text("1️⃣ **Send the Post**\n(Text, Photo, Audio, Poll, etc)", 
@@ -239,13 +242,23 @@ async def callback_router(c, q):
         cid = d.split("tasks_")[1]
         await list_active_tasks(uid, q.message, cid)
     
+    # ✅ IMPROVED DELETE LOGIC
     elif d.startswith("del_task_"):
         tid = d.split("del_task_")[1]
         try: scheduler.remove_job(tid)
         except: pass
-        await delete_task(tid)
-        await q.answer("Task deleted")
-        await show_main_menu(q.message)
+        
+        # Get Chat ID to refresh menu
+        chat_id = await delete_task(tid)
+        
+        # Show Toast Notification
+        await q.answer("🗑 Task Deleted Successfully!")
+        
+        # Refresh the list IN PLACE (No new message)
+        if chat_id:
+            await list_active_tasks(uid, q.message, chat_id)
+        else:
+            await show_main_menu(q.message)
 
 # --- INPUTS ---
 
@@ -266,32 +279,27 @@ async def handle_inputs(c, m):
             chat = m.forward_from_chat
             await add_channel(uid, str(chat.id), chat.title)
             user_state[uid] = None
-            try: await m.delete() # Cleanup
+            try: await m.delete() 
             except: pass
             await m.reply(f"✅ Added **{chat.title}**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu", callback_data="menu_home")]]))
         else: await m.reply("❌ Invalid.")
 
-    # ✅ UPDATED: Audio, Voice, Poll Support
     elif step == "waiting_content":
         content_type = "text"
         file_id = None
         content_text = m.text or m.caption or ""
         entities_json = None
         
-        # 1. Poll Handling
         if m.poll:
             content_type = "poll"
             content_text = m.poll.question
-            # Serialize Poll Config into 'entities' column
             poll_data = {
                 "options": [opt.text for opt in m.poll.options],
                 "is_anonymous": m.poll.is_anonymous,
                 "allows_multiple_answers": m.poll.allows_multiple_answers,
-                "type": str(m.poll.type) # "PollType.REGULAR" or "QUIZ"
+                "type": str(m.poll.type) 
             }
             entities_json = json.dumps(poll_data)
-        
-        # 2. Media Handling
         else:
             raw_entities = m.entities or m.caption_entities
             entities_json = serialize_entities(raw_entities)
@@ -324,11 +332,9 @@ async def handle_inputs(c, m):
         })
         user_state[uid] = st
         
-        # ✅ CLEAN UI: Delete User Msg, Edit Bot Msg
         try: await m.delete()
         except: pass
         
-        # We try to edit the previous bot message if we saved its ID
         if "menu_msg_id" in st:
             try:
                 await app.edit_message_text(
@@ -341,9 +347,8 @@ async def handle_inputs(c, m):
                         [InlineKeyboardButton("📅 Custom Date", callback_data="time_custom")]
                     ])
                 )
-                return # Exit if edit successful
-            except: pass # Fallback to sending new if edit fails
-            
+                return 
+            except: pass 
         await show_time_menu(m, uid)
 
     elif step == "waiting_custom_date":
@@ -357,7 +362,7 @@ async def handle_inputs(c, m):
             try: await m.delete()
             except: pass
             
-            await ask_repetition(m, uid) # This creates/edits logic in helper
+            await ask_repetition(m, uid) 
         except: await m.reply("❌ Invalid Date.")
 
 # --- UI MENUS ---
@@ -408,14 +413,8 @@ async def ask_repetition(m, uid):
     st = user_state[uid]
     time_str = st["start_time"].strftime("%d-%b %I:%M %p")
     txt = f"3️⃣ **Repeat?**\nSelected Time: `{time_str}`"
-    
-    # If called from custom date text input, we might need to send fresh if we can't edit
-    if isinstance(m, Message) and m.from_user.id == uid: # It's a user message
-         # We try to edit the bot's last message if we stored it?
-         # Simplest: just send new one if it's text input flow
-         await m.reply(txt, reply_markup=InlineKeyboardMarkup(kb))
-    else: 
-        await m.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
+    if isinstance(m, Message): await m.reply(txt, reply_markup=InlineKeyboardMarkup(kb))
+    else: await m.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
 
 async def ask_settings(m, uid):
     st = user_state[uid]
@@ -466,16 +465,17 @@ async def list_active_tasks(uid, m, cid):
         txt += f"• `{time_str}` ({t['repeat_interval'] or 'Once'})\n"
         kb.append([InlineKeyboardButton(f"🗑 Delete {time_str}", callback_data=f"del_task_{t['task_id']}")])
     kb.append([InlineKeyboardButton("🔙 Back", callback_data=f"ch_{cid}")])
-    await m.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
+    
+    # Force Edit to refresh list (Clean UI)
+    try: await m.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
+    except: pass # Ignore if text didn't change
 
 # --- WORKER ---
 async def create_task_logic(uid, q):
     st = user_state[uid]
     tid = f"task_{int(datetime.datetime.now().timestamp())}"
     
-    # Detailed Final Summary Logic
     t_str = st["start_time"].strftime("%d-%b %I:%M %p")
-    # Fetch Channel Title
     chs = await get_channels(uid)
     ch_title = "Channel"
     for c in chs:
@@ -502,7 +502,6 @@ async def create_task_logic(uid, q):
         await save_task(task_data)
         add_scheduler_job(tid, task_data)
         
-        # ✅ FINAL DETAILED CONFIRMATION
         final_txt = (f"🎉 **Scheduled Successfully!**\n\n"
                      f"📢 **Channel:** `{ch_title}`\n"
                      f"📝 **Content:** `{st['content_type'].upper()}`\n"
@@ -550,9 +549,7 @@ def add_scheduler_job(tid, t):
                 sent = None
                 caption = t["content_text"]
                 
-                # ✅ POLL VS ENTITIES LOGIC
                 if t["content_type"] == "poll":
-                    # Deserialize Poll Data
                     poll_cfg = json.loads(t["entities"])
                     try:
                         sent = await user.send_poll(
@@ -564,7 +561,6 @@ def add_scheduler_job(tid, t):
                         )
                     except Exception as e: logger.error(f"Poll Error: {e}")
                 else:
-                    # Regular Media with Entities
                     entities_objs = deserialize_entities(t["entities"])
                     try:
                         if t["content_type"] == "text":
