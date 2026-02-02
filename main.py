@@ -44,8 +44,8 @@ async def init_db():
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_sessions (user_id BIGINT PRIMARY KEY, session_string TEXT)''')
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_channels (user_id BIGINT, channel_id TEXT, title TEXT, PRIMARY KEY(user_id, channel_id))''')
         
-        # Using V5 table to ensure clean slate
-        await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_tasks_v5
+        # ✅ NEW TABLE v6 (Clean Slate)
+        await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_tasks_v6
                           (task_id TEXT PRIMARY KEY, owner_id BIGINT, chat_id TEXT, 
                            content_type TEXT, content_text TEXT, file_id TEXT, 
                            pin BOOLEAN, delete_old BOOLEAN, 
@@ -80,7 +80,7 @@ async def del_channel(user_id, cid):
 async def save_task(t):
     pool = await get_db()
     await pool.execute("""
-        INSERT INTO userbot_tasks_v5
+        INSERT INTO userbot_tasks_v6
         (task_id, owner_id, chat_id, content_type, content_text, file_id, pin, delete_old, repeat_interval, start_time, last_msg_id)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         ON CONFLICT (task_id) DO UPDATE SET last_msg_id = $11, start_time = $10
@@ -89,23 +89,23 @@ async def save_task(t):
 
 async def get_all_tasks():
     pool = await get_db()
-    return [dict(x) for x in await pool.fetch("SELECT * FROM userbot_tasks_v5")]
+    return [dict(x) for x in await pool.fetch("SELECT * FROM userbot_tasks_v6")]
 
 async def get_user_tasks(user_id, chat_id):
     pool = await get_db()
-    return [dict(x) for x in await pool.fetch("SELECT * FROM userbot_tasks_v5 WHERE owner_id = $1 AND chat_id = $2", user_id, chat_id)]
+    return [dict(x) for x in await pool.fetch("SELECT * FROM userbot_tasks_v6 WHERE owner_id = $1 AND chat_id = $2", user_id, chat_id)]
 
 async def delete_task(task_id):
     pool = await get_db()
-    await pool.execute("DELETE FROM userbot_tasks_v5 WHERE task_id = $1", task_id)
+    await pool.execute("DELETE FROM userbot_tasks_v6 WHERE task_id = $1", task_id)
 
 async def update_last_msg(task_id, msg_id):
     pool = await get_db()
-    await pool.execute("UPDATE userbot_tasks_v5 SET last_msg_id = $1 WHERE task_id = $2", msg_id, task_id)
+    await pool.execute("UPDATE userbot_tasks_v6 SET last_msg_id = $1 WHERE task_id = $2", msg_id, task_id)
 
 async def update_next_run(task_id, next_time_str):
     pool = await get_db()
-    await pool.execute("UPDATE userbot_tasks_v5 SET start_time = $1 WHERE task_id = $2", next_time_str, task_id)
+    await pool.execute("UPDATE userbot_tasks_v6 SET start_time = $1 WHERE task_id = $2", next_time_str, task_id)
 
 # --- BOT INTERFACE ---
 
@@ -116,7 +116,7 @@ async def start_cmd(c, m):
         await show_main_menu(m)
     else:
         await m.reply_text(
-            "👋 **Manager Bot V9**\n\nI schedule posts for you.\nFirst, I need to log in to your account.",
+            "👋 **Manager Bot V9 (Deep Fix)**\n\nI schedule posts for you.\nFirst, I need to log in to your account.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Login", callback_data="login_start")]])
         )
 
@@ -379,7 +379,7 @@ async def create_task_logic(uid, q):
         logger.error(f"Save Task Error: {e}")
         await q.message.edit_text(f"❌ Error saving task: {e}")
 
-# --- WORKER (FIXED PEER RESOLUTION) ---
+# --- WORKER (FIXED #4: DEEP PEER RESOLUTION) ---
 def add_scheduler_job(tid, t):
     if scheduler is None:
         logger.error(f"❌ SCHEDULER IS NONE. Job {tid} skipped.")
@@ -406,19 +406,25 @@ def add_scheduler_job(tid, t):
             async with Client(":memory:", api_id=API_ID, api_hash=API_HASH, session_string=session) as user:
                 target = int(t["chat_id"])
                 
-                # ✅ FIX: AGGRESSIVE PEER RESOLUTION
-                # The issue is Pyrogram doesn't know the channel ID from a fresh session.
-                # We force it to fetch the chat details from the network.
-                try: 
-                    # Attempt to fetch the specific chat to cache the access hash
+                # ✅ V9 FIX: Forceful Peer Resolution
+                # We try to find the channel in the user's dialog list.
+                # 'limit=None' scans ALL chats. This fixes 'Peer Id Invalid'.
+                peer_resolved = False
+                try:
                     await user.get_chat(target)
-                    logger.info(f"✅ Resolved Peer {target}")
-                except Exception as peer_err:
-                    logger.warning(f"⚠️ Direct resolve failed: {peer_err}. Trying dialogs...")
-                    # Fallback: Fetch ALL dialogs (slower but safer)
-                    try: await user.get_dialogs()
-                    except: pass
-
+                    peer_resolved = True
+                except:
+                    logger.warning(f"⚠️ Job {tid}: Direct resolve failed. Scanning all dialogs...")
+                    async for dialog in user.get_dialogs(limit=200): # Scan last 200 chats
+                        if dialog.chat.id == target:
+                            logger.info(f"✅ Job {tid}: Found peer in dialogs!")
+                            peer_resolved = True
+                            break
+                
+                if not peer_resolved:
+                    logger.error(f"❌ Job {tid}: Could not find channel {target} in dialogs.")
+                    # We continue anyway, maybe send_message will get lucky
+                
                 # 1. Delete Old Message
                 if t["delete_old"] and t["last_msg_id"]:
                     try: 
