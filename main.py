@@ -4,9 +4,9 @@ import asyncio
 import datetime
 import pytz
 import asyncpg
-import json  # Needed to serialize entities
-from pyrogram import Client, filters, idle, errors
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
+import json
+from pyrogram import Client, filters, idle, errors, enums
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, MessageEntity
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.date import DateTrigger
@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ManagerBot")
 
 # --- INIT ---
-app = Client("manager_premium_v11", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("manager_premium_v12", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 scheduler = None 
 db_pool = None
 
@@ -43,11 +43,11 @@ async def init_db():
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_sessions (user_id BIGINT PRIMARY KEY, session_string TEXT)''')
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_channels (user_id BIGINT, channel_id TEXT, title TEXT, PRIMARY KEY(user_id, channel_id))''')
         
-        # V7 TABLE: Added 'entities' column to store Premium formatting
+        # Using V7 table (Supports Entities)
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_tasks_v7
                           (task_id TEXT PRIMARY KEY, owner_id BIGINT, chat_id TEXT, 
                            content_type TEXT, content_text TEXT, file_id TEXT, 
-                           entities TEXT,  -- New Column for Premium Data
+                           entities TEXT, 
                            pin BOOLEAN, delete_old BOOLEAN, 
                            repeat_interval TEXT, start_time TEXT, last_msg_id BIGINT)''')
 
@@ -79,13 +79,11 @@ async def del_channel(user_id, cid):
 
 async def save_task(t):
     pool = await get_db()
-    # Save entities as JSON string
-    entities_json = t.get('entities') # Already serialized in logic
     await pool.execute("""
         INSERT INTO userbot_tasks_v7 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
         ON CONFLICT (task_id) DO UPDATE SET last_msg_id = $12, start_time = $11
     """, t['task_id'], t['owner_id'], t['chat_id'], t['content_type'], t['content_text'], t['file_id'], 
-       entities_json, t['pin'], t['delete_old'], t['repeat_interval'], t['start_time'], t['last_msg_id'])
+       t['entities'], t['pin'], t['delete_old'], t['repeat_interval'], t['start_time'], t['last_msg_id'])
 
 async def get_all_tasks():
     pool = await get_db()
@@ -107,6 +105,47 @@ async def update_next_run(task_id, next_time_str):
     pool = await get_db()
     await pool.execute("UPDATE userbot_tasks_v7 SET start_time = $1 WHERE task_id = $2", next_time_str, task_id)
 
+# --- SERIALIZATION HELPERS (The Magic Fix) ---
+
+def serialize_entities(entities_list):
+    if not entities_list: return None
+    data = []
+    for e in entities_list:
+        data.append({
+            "type": str(e.type), # e.g. "MessageEntityType.BOLD"
+            "offset": e.offset,
+            "length": e.length,
+            "url": e.url,
+            "language": e.language,
+            "custom_emoji_id": e.custom_emoji_id
+        })
+    return json.dumps(data)
+
+def deserialize_entities(json_str):
+    if not json_str: return None
+    try:
+        data = json.loads(json_str)
+        entities = []
+        for item in data:
+            # Convert string "MessageEntityType.BOLD" back to Enum
+            type_str = item["type"].split(".")[-1] 
+            e_type = getattr(enums.MessageEntityType, type_str)
+            
+            # Re-create the Real Object
+            entity = MessageEntity(
+                type=e_type,
+                offset=item["offset"],
+                length=item["length"],
+                url=item["url"],
+                language=item["language"],
+                custom_emoji_id=item["custom_emoji_id"]
+            )
+            entities.append(entity)
+        return entities
+    except Exception as e:
+        logger.error(f"Entity Parse Error: {e}")
+        return None
+
 # --- BOT INTERFACE ---
 
 @app.on_message(filters.command("manage") | filters.command("start"))
@@ -116,7 +155,7 @@ async def start_cmd(c, m):
         await show_main_menu(m)
     else:
         await m.reply_text(
-            "👋 **Manager Bot V11 (Premium)**\n\nPlease login to start.",
+            "👋 **Manager Bot V12 (Entities Fixed)**\n\nPlease login to start.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Login", callback_data="login_start")]])
         )
 
@@ -137,7 +176,6 @@ async def callback_router(c, q):
         await del_session(uid)
         await q.message.edit_text("👋 Logged out.")
 
-    # --- CHANNELS ---
     elif d == "list_channels":
         await show_channels(uid, q.message)
     
@@ -156,14 +194,12 @@ async def callback_router(c, q):
         await q.answer("Removed!")
         await show_channels(uid, q.message)
 
-    # --- POST CREATION FLOW ---
     elif d.startswith("new_"):
         cid = d.split("new_")[1]
         user_state[uid] = {"step": "waiting_content", "target": cid}
         await q.message.edit_text("1️⃣ **Send the Post**\n(Text, Photo, Video, or Sticker)", 
                                   reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data=f"ch_{cid}")]]))
 
-    # --- TIME SELECTION ---
     elif d == "step_time":
         await show_time_menu(q.message, uid)
 
@@ -175,7 +211,6 @@ async def callback_router(c, q):
             await q.message.edit_text(
                 "📅 **Enter Custom Date**\n\n"
                 "Format: `02-Feb 11:56 PM`\n"
-                "Example: `05-Feb 02:30 PM`\n\n"
                 "Type it below 👇",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="step_time")]])
             )
@@ -191,7 +226,6 @@ async def callback_router(c, q):
         user_state[uid]["start_time"] = run_time
         await ask_repetition(q.message, uid)
 
-    # --- REPETITION ---
     elif d.startswith("rep_"):
         val = d.split("rep_")[1]
         interval = None
@@ -201,7 +235,6 @@ async def callback_router(c, q):
         user_state[uid]["interval"] = interval
         await ask_settings(q.message, uid)
 
-    # --- SETTINGS & CONFIRM ---
     elif d in ["toggle_pin", "toggle_del"]:
         st = user_state[uid]
         st.setdefault("pin", True)
@@ -216,7 +249,6 @@ async def callback_router(c, q):
     elif d == "save_task":
         await create_task_logic(uid, q)
 
-    # --- TASK MANAGEMENT ---
     elif d.startswith("tasks_"):
         cid = d.split("tasks_")[1]
         await list_active_tasks(uid, q.message, cid)
@@ -229,7 +261,7 @@ async def callback_router(c, q):
         await q.answer("Task deleted")
         await show_main_menu(q.message)
 
-# --- MESSAGES & INPUTS ---
+# --- INPUTS ---
 
 @app.on_message(filters.private & ~filters.command("manage") & ~filters.command("start"))
 async def handle_inputs(c, m):
@@ -243,7 +275,6 @@ async def handle_inputs(c, m):
     st = user_state.get(uid, {})
     step = st.get("step")
 
-    # 1. Add Channel
     if step == "waiting_forward":
         if m.forward_from_chat:
             chat = m.forward_from_chat
@@ -253,15 +284,14 @@ async def handle_inputs(c, m):
         else:
             await m.reply("❌ Invalid. Forward from a channel.")
 
-    # 2. Receive Content (PREMIUM FIX APPLIED HERE)
     elif step == "waiting_content":
         content_type = "text"
         file_id = None
         content_text = m.text or m.caption or ""
         
-        # ✅ CAPTURE ENTITIES (This holds the Premium Custom Emoji data)
+        # ✅ CAPTURE ENTITIES SAFELY
         raw_entities = m.entities or m.caption_entities
-        entities_str = str(raw_entities) if raw_entities else None
+        entities_json = serialize_entities(raw_entities)
 
         if m.photo:
             content_type = "photo"
@@ -280,14 +310,13 @@ async def handle_inputs(c, m):
             "content_type": content_type,
             "content_text": content_text,
             "file_id": file_id,
-            "entities": entities_str, # Store raw string of entities
+            "entities": entities_json, # Store JSON string
             "step": "waiting_time"
         })
         user_state[uid] = st
         
         await show_time_menu(m, uid)
 
-    # 3. Custom Date Input
     elif step == "waiting_custom_date":
         try:
             current_year = datetime.datetime.now(IST).year
@@ -400,7 +429,7 @@ async def list_active_tasks(uid, m, cid):
     kb.append([InlineKeyboardButton("🔙 Back", callback_data=f"ch_{cid}")])
     await m.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
 
-# --- WORKER (With Premium Entity Support) ---
+# --- WORKER ---
 async def create_task_logic(uid, q):
     st = user_state[uid]
     tid = f"task_{int(datetime.datetime.now().timestamp())}"
@@ -412,7 +441,7 @@ async def create_task_logic(uid, q):
         "content_type": st["content_type"],
         "content_text": st["content_text"],
         "file_id": st["file_id"],
-        "entities": st.get("entities"), # Pass the entities
+        "entities": st.get("entities"), # Already JSON
         "pin": st["pin"],
         "delete_old": st["del"],
         "repeat_interval": st["interval"],
@@ -460,21 +489,22 @@ def add_scheduler_job(tid, t):
                     try: await user.delete_messages(target, int(t["last_msg_id"]))
                     except: pass
                 
-                # 2. Send (WITH ENTITIES)
+                # 2. Send (WITH RECONSTRUCTED ENTITIES)
                 sent = None
                 caption = t["content_text"]
-                # Parse entities back from string if they exist
-                entities = eval(t["entities"]) if t["entities"] and t["entities"] != "None" else None
+                
+                # ✅ RE-ANIMATE ENTITIES OBJECTS
+                entities_objs = deserialize_entities(t["entities"])
 
                 try:
                     if t["content_type"] == "text":
-                        sent = await user.send_message(target, t["content_text"], entities=entities)
+                        sent = await user.send_message(target, t["content_text"], entities=entities_objs)
                     elif t["content_type"] == "photo":
-                        sent = await user.send_photo(target, t["file_id"], caption=caption, caption_entities=entities)
+                        sent = await user.send_photo(target, t["file_id"], caption=caption, caption_entities=entities_objs)
                     elif t["content_type"] == "video":
-                        sent = await user.send_video(target, t["file_id"], caption=caption, caption_entities=entities)
+                        sent = await user.send_video(target, t["file_id"], caption=caption, caption_entities=entities_objs)
                     elif t["content_type"] == "document":
-                        sent = await user.send_document(target, t["file_id"], caption=caption, caption_entities=entities)
+                        sent = await user.send_document(target, t["file_id"], caption=caption, caption_entities=entities_objs)
                     elif t["content_type"] == "sticker":
                         sent = await user.send_sticker(target, t["file_id"])
                     
