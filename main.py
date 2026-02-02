@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ManagerBot")
 
 # --- INIT ---
-app = Client("manager_audio_v14", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("manager_poll_v15", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 scheduler = None 
 db_pool = None
 
@@ -147,7 +147,7 @@ async def start_cmd(c, m):
         await show_main_menu(m)
     else:
         await m.reply_text(
-            "👋 **Manager Bot V14 (Audio Support)**\n\nPlease login to start.",
+            "👋 **Manager Bot V15 (Polls + Clean UI)**\n\nPlease login to start.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Login", callback_data="login_start")]])
         )
 
@@ -188,8 +188,10 @@ async def callback_router(c, q):
 
     elif d.startswith("new_"):
         cid = d.split("new_")[1]
-        user_state[uid] = {"step": "waiting_content", "target": cid}
-        await q.message.edit_text("1️⃣ **Send the Post**\n(Text, Photo, Audio, Voice, or Sticker)", 
+        # Store the Menu Message ID to update it later
+        st = {"step": "waiting_content", "target": cid, "menu_msg_id": q.message.id}
+        user_state[uid] = st
+        await q.message.edit_text("1️⃣ **Send the Post**\n(Text, Photo, Audio, Poll, etc)", 
                                   reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data=f"ch_{cid}")]]))
 
     elif d == "step_time":
@@ -264,36 +266,54 @@ async def handle_inputs(c, m):
             chat = m.forward_from_chat
             await add_channel(uid, str(chat.id), chat.title)
             user_state[uid] = None
+            try: await m.delete() # Cleanup
+            except: pass
             await m.reply(f"✅ Added **{chat.title}**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu", callback_data="menu_home")]]))
         else: await m.reply("❌ Invalid.")
 
-    # ✅ UPDATED: Audio & Voice Support
+    # ✅ UPDATED: Audio, Voice, Poll Support
     elif step == "waiting_content":
         content_type = "text"
         file_id = None
         content_text = m.text or m.caption or ""
+        entities_json = None
         
-        raw_entities = m.entities or m.caption_entities
-        entities_json = serialize_entities(raw_entities)
+        # 1. Poll Handling
+        if m.poll:
+            content_type = "poll"
+            content_text = m.poll.question
+            # Serialize Poll Config into 'entities' column
+            poll_data = {
+                "options": [opt.text for opt in m.poll.options],
+                "is_anonymous": m.poll.is_anonymous,
+                "allows_multiple_answers": m.poll.allows_multiple_answers,
+                "type": str(m.poll.type) # "PollType.REGULAR" or "QUIZ"
+            }
+            entities_json = json.dumps(poll_data)
+        
+        # 2. Media Handling
+        else:
+            raw_entities = m.entities or m.caption_entities
+            entities_json = serialize_entities(raw_entities)
 
-        if m.photo:
-            content_type = "photo"
-            file_id = m.photo.file_id
-        elif m.video:
-            content_type = "video"
-            file_id = m.video.file_id
-        elif m.audio: # <-- NEW
-            content_type = "audio"
-            file_id = m.audio.file_id
-        elif m.voice: # <-- NEW
-            content_type = "voice"
-            file_id = m.voice.file_id
-        elif m.document:
-            content_type = "document"
-            file_id = m.document.file_id
-        elif m.sticker:
-            content_type = "sticker"
-            file_id = m.sticker.file_id
+            if m.photo:
+                content_type = "photo"
+                file_id = m.photo.file_id
+            elif m.video:
+                content_type = "video"
+                file_id = m.video.file_id
+            elif m.audio:
+                content_type = "audio"
+                file_id = m.audio.file_id
+            elif m.voice:
+                content_type = "voice"
+                file_id = m.voice.file_id
+            elif m.document:
+                content_type = "document"
+                file_id = m.document.file_id
+            elif m.sticker:
+                content_type = "sticker"
+                file_id = m.sticker.file_id
         
         st.update({
             "content_type": content_type,
@@ -303,6 +323,27 @@ async def handle_inputs(c, m):
             "step": "waiting_time"
         })
         user_state[uid] = st
+        
+        # ✅ CLEAN UI: Delete User Msg, Edit Bot Msg
+        try: await m.delete()
+        except: pass
+        
+        # We try to edit the previous bot message if we saved its ID
+        if "menu_msg_id" in st:
+            try:
+                await app.edit_message_text(
+                    chat_id=m.chat.id, 
+                    message_id=st["menu_msg_id"], 
+                    text="2️⃣ **When to post?**", 
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🚀 Post Now", callback_data="time_0")],
+                        [InlineKeyboardButton("⏱️ +15 Mins", callback_data="time_15"), InlineKeyboardButton("🕐 +1 Hour", callback_data="time_60")],
+                        [InlineKeyboardButton("📅 Custom Date", callback_data="time_custom")]
+                    ])
+                )
+                return # Exit if edit successful
+            except: pass # Fallback to sending new if edit fails
+            
         await show_time_menu(m, uid)
 
     elif step == "waiting_custom_date":
@@ -312,7 +353,11 @@ async def handle_inputs(c, m):
             dt = datetime.datetime.strptime(full_str, "%Y-%d-%b %I:%M %p")
             dt = IST.localize(dt)
             user_state[uid]["start_time"] = dt
-            await ask_repetition(m, uid)
+            
+            try: await m.delete()
+            except: pass
+            
+            await ask_repetition(m, uid) # This creates/edits logic in helper
         except: await m.reply("❌ Invalid Date.")
 
 # --- UI MENUS ---
@@ -363,8 +408,14 @@ async def ask_repetition(m, uid):
     st = user_state[uid]
     time_str = st["start_time"].strftime("%d-%b %I:%M %p")
     txt = f"3️⃣ **Repeat?**\nSelected Time: `{time_str}`"
-    if isinstance(m, Message): await m.reply(txt, reply_markup=InlineKeyboardMarkup(kb))
-    else: await m.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
+    
+    # If called from custom date text input, we might need to send fresh if we can't edit
+    if isinstance(m, Message) and m.from_user.id == uid: # It's a user message
+         # We try to edit the bot's last message if we stored it?
+         # Simplest: just send new one if it's text input flow
+         await m.reply(txt, reply_markup=InlineKeyboardMarkup(kb))
+    else: 
+        await m.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
 
 async def ask_settings(m, uid):
     st = user_state[uid]
@@ -390,8 +441,9 @@ async def confirm_task(m, uid):
     r_str = st["interval"] if st["interval"] else "Once"
     
     txt = (f"✅ **Summary**\n"
-           f"📅 `{t_str}`\n"
-           f"🔁 `{r_str}`\n"
+           f"📢 Type: `{st['content_type'].upper()}`\n"
+           f"📅 Time: `{t_str}`\n"
+           f"🔁 Repeat: `{r_str}`\n"
            f"📌 Pin: {st['pin']} | 🗑 Del: {st['del']}")
     
     kb = [[InlineKeyboardButton("✅ Schedule It", callback_data="save_task")],
@@ -421,6 +473,16 @@ async def create_task_logic(uid, q):
     st = user_state[uid]
     tid = f"task_{int(datetime.datetime.now().timestamp())}"
     
+    # Detailed Final Summary Logic
+    t_str = st["start_time"].strftime("%d-%b %I:%M %p")
+    # Fetch Channel Title
+    chs = await get_channels(uid)
+    ch_title = "Channel"
+    for c in chs:
+        if c['channel_id'] == st['target']:
+            ch_title = c['title']
+            break
+
     task_data = {
         "task_id": tid,
         "owner_id": uid,
@@ -439,7 +501,17 @@ async def create_task_logic(uid, q):
     try:
         await save_task(task_data)
         add_scheduler_job(tid, task_data)
-        await q.message.edit_text("🎉 **Scheduled!**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="menu_home")]]))
+        
+        # ✅ FINAL DETAILED CONFIRMATION
+        final_txt = (f"🎉 **Scheduled Successfully!**\n\n"
+                     f"📢 **Channel:** `{ch_title}`\n"
+                     f"📝 **Content:** `{st['content_type'].upper()}`\n"
+                     f"📅 **Time:** `{t_str}`\n"
+                     f"🔁 **Repeat:** `{st['interval'] or 'No'}`\n"
+                     f"📌 **Pin:** {'Yes' if st['pin'] else 'No'}\n"
+                     f"🗑 **Auto-Delete Old:** {'Yes' if st['del'] else 'No'}")
+        
+        await q.message.edit_text(final_txt, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="menu_home")]]))
     except Exception as e:
         logger.error(f"Save Error: {e}")
         await q.message.edit_text(f"❌ Error: {e}")
@@ -464,8 +536,6 @@ def add_scheduler_job(tid, t):
             
             async with Client(":memory:", api_id=API_ID, api_hash=API_HASH, session_string=session) as user:
                 target = int(t["chat_id"])
-                
-                # Peer Resolution
                 try: await user.get_chat(target)
                 except:
                     async for dialog in user.get_dialogs(limit=200):
@@ -476,42 +546,52 @@ def add_scheduler_job(tid, t):
                     try: await user.delete_messages(target, int(t["last_msg_id"]))
                     except: pass
                 
-                # 2. Send (UPDATED FOR AUDIO)
+                # 2. Send
                 sent = None
                 caption = t["content_text"]
-                entities_objs = deserialize_entities(t["entities"])
-
-                try:
-                    if t["content_type"] == "text":
-                        sent = await user.send_message(target, t["content_text"], entities=entities_objs)
-                    elif t["content_type"] == "photo":
-                        sent = await user.send_photo(target, t["file_id"], caption=caption, caption_entities=entities_objs)
-                    elif t["content_type"] == "video":
-                        sent = await user.send_video(target, t["file_id"], caption=caption, caption_entities=entities_objs)
-                    # ✅ NEW: Send Audio
-                    elif t["content_type"] == "audio":
-                        sent = await user.send_audio(target, t["file_id"], caption=caption, caption_entities=entities_objs)
-                    # ✅ NEW: Send Voice
-                    elif t["content_type"] == "voice":
-                        sent = await user.send_voice(target, t["file_id"], caption=caption, caption_entities=entities_objs)
-                    elif t["content_type"] == "document":
-                        sent = await user.send_document(target, t["file_id"], caption=caption, caption_entities=entities_objs)
-                    elif t["content_type"] == "sticker":
-                        sent = await user.send_sticker(target, t["file_id"])
-                    
-                    logger.info(f"✅ Job {tid}: Message Sent! ID: {sent.id}")
-                except Exception as e:
-                    logger.error(f"❌ Job {tid} Fail: {e}")
+                
+                # ✅ POLL VS ENTITIES LOGIC
+                if t["content_type"] == "poll":
+                    # Deserialize Poll Data
+                    poll_cfg = json.loads(t["entities"])
+                    try:
+                        sent = await user.send_poll(
+                            chat_id=target,
+                            question=caption,
+                            options=poll_cfg["options"],
+                            is_anonymous=poll_cfg["is_anonymous"],
+                            allows_multiple_answers=poll_cfg["allows_multiple_answers"]
+                        )
+                    except Exception as e: logger.error(f"Poll Error: {e}")
+                else:
+                    # Regular Media with Entities
+                    entities_objs = deserialize_entities(t["entities"])
+                    try:
+                        if t["content_type"] == "text":
+                            sent = await user.send_message(target, t["content_text"], entities=entities_objs)
+                        elif t["content_type"] == "photo":
+                            sent = await user.send_photo(target, t["file_id"], caption=caption, caption_entities=entities_objs)
+                        elif t["content_type"] == "video":
+                            sent = await user.send_video(target, t["file_id"], caption=caption, caption_entities=entities_objs)
+                        elif t["content_type"] == "audio":
+                            sent = await user.send_audio(target, t["file_id"], caption=caption, caption_entities=entities_objs)
+                        elif t["content_type"] == "voice":
+                            sent = await user.send_voice(target, t["file_id"], caption=caption, caption_entities=entities_objs)
+                        elif t["content_type"] == "document":
+                            sent = await user.send_document(target, t["file_id"], caption=caption, caption_entities=entities_objs)
+                        elif t["content_type"] == "sticker":
+                            sent = await user.send_sticker(target, t["file_id"])
+                    except Exception as e: logger.error(f"Send Error: {e}")
 
                 if sent:
+                    logger.info(f"✅ Job {tid}: Message Sent! ID: {sent.id}")
                     if t["pin"]:
                         try: 
-                            pinned_msg = await sent.pin()
-                            if isinstance(pinned_msg, Message): await pinned_msg.delete()
+                            pinned = await sent.pin()
+                            if isinstance(pinned, Message): await pinned.delete()
                             await asyncio.sleep(0.5)
                             await user.delete_messages(target, sent.id + 1)
                         except: pass
-                    
                     await update_last_msg(tid, sent.id)
 
         except Exception as e:
