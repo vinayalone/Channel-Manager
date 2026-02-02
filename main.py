@@ -4,8 +4,9 @@ import asyncio
 import datetime
 import pytz
 import asyncpg
+import json  # Needed to serialize entities
 from pyrogram import Client, filters, idle, errors
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.date import DateTrigger
@@ -21,7 +22,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ManagerBot")
 
 # --- INIT ---
-app = Client("manager_ui_v10", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("manager_premium_v11", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 scheduler = None 
 db_pool = None
 
@@ -41,9 +42,12 @@ async def init_db():
     async with pool.acquire() as conn:
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_sessions (user_id BIGINT PRIMARY KEY, session_string TEXT)''')
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_channels (user_id BIGINT, channel_id TEXT, title TEXT, PRIMARY KEY(user_id, channel_id))''')
-        await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_tasks_v6
+        
+        # V7 TABLE: Added 'entities' column to store Premium formatting
+        await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_tasks_v7
                           (task_id TEXT PRIMARY KEY, owner_id BIGINT, chat_id TEXT, 
                            content_type TEXT, content_text TEXT, file_id TEXT, 
+                           entities TEXT,  -- New Column for Premium Data
                            pin BOOLEAN, delete_old BOOLEAN, 
                            repeat_interval TEXT, start_time TEXT, last_msg_id BIGINT)''')
 
@@ -75,31 +79,33 @@ async def del_channel(user_id, cid):
 
 async def save_task(t):
     pool = await get_db()
+    # Save entities as JSON string
+    entities_json = t.get('entities') # Already serialized in logic
     await pool.execute("""
-        INSERT INTO userbot_tasks_v6 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-        ON CONFLICT (task_id) DO UPDATE SET last_msg_id = $11, start_time = $10
+        INSERT INTO userbot_tasks_v7 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        ON CONFLICT (task_id) DO UPDATE SET last_msg_id = $12, start_time = $11
     """, t['task_id'], t['owner_id'], t['chat_id'], t['content_type'], t['content_text'], t['file_id'], 
-       t['pin'], t['delete_old'], t['repeat_interval'], t['start_time'], t['last_msg_id'])
+       entities_json, t['pin'], t['delete_old'], t['repeat_interval'], t['start_time'], t['last_msg_id'])
 
 async def get_all_tasks():
     pool = await get_db()
-    return [dict(x) for x in await pool.fetch("SELECT * FROM userbot_tasks_v6")]
+    return [dict(x) for x in await pool.fetch("SELECT * FROM userbot_tasks_v7")]
 
 async def get_user_tasks(user_id, chat_id):
     pool = await get_db()
-    return [dict(x) for x in await pool.fetch("SELECT * FROM userbot_tasks_v6 WHERE owner_id = $1 AND chat_id = $2", user_id, chat_id)]
+    return [dict(x) for x in await pool.fetch("SELECT * FROM userbot_tasks_v7 WHERE owner_id = $1 AND chat_id = $2", user_id, chat_id)]
 
 async def delete_task(task_id):
     pool = await get_db()
-    await pool.execute("DELETE FROM userbot_tasks_v6 WHERE task_id = $1", task_id)
+    await pool.execute("DELETE FROM userbot_tasks_v7 WHERE task_id = $1", task_id)
 
 async def update_last_msg(task_id, msg_id):
     pool = await get_db()
-    await pool.execute("UPDATE userbot_tasks_v6 SET last_msg_id = $1 WHERE task_id = $2", msg_id, task_id)
+    await pool.execute("UPDATE userbot_tasks_v7 SET last_msg_id = $1 WHERE task_id = $2", msg_id, task_id)
 
 async def update_next_run(task_id, next_time_str):
     pool = await get_db()
-    await pool.execute("UPDATE userbot_tasks_v6 SET start_time = $1 WHERE task_id = $2", next_time_str, task_id)
+    await pool.execute("UPDATE userbot_tasks_v7 SET start_time = $1 WHERE task_id = $2", next_time_str, task_id)
 
 # --- BOT INTERFACE ---
 
@@ -110,7 +116,7 @@ async def start_cmd(c, m):
         await show_main_menu(m)
     else:
         await m.reply_text(
-            "👋 **Manager Bot**\n\nPlease login to start.",
+            "👋 **Manager Bot V11 (Premium)**\n\nPlease login to start.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Login", callback_data="login_start")]])
         )
 
@@ -247,11 +253,15 @@ async def handle_inputs(c, m):
         else:
             await m.reply("❌ Invalid. Forward from a channel.")
 
-    # 2. Receive Content
+    # 2. Receive Content (PREMIUM FIX APPLIED HERE)
     elif step == "waiting_content":
         content_type = "text"
         file_id = None
         content_text = m.text or m.caption or ""
+        
+        # ✅ CAPTURE ENTITIES (This holds the Premium Custom Emoji data)
+        raw_entities = m.entities or m.caption_entities
+        entities_str = str(raw_entities) if raw_entities else None
 
         if m.photo:
             content_type = "photo"
@@ -270,33 +280,26 @@ async def handle_inputs(c, m):
             "content_type": content_type,
             "content_text": content_text,
             "file_id": file_id,
-            "step": "waiting_time" # Move to next step
+            "entities": entities_str, # Store raw string of entities
+            "step": "waiting_time"
         })
         user_state[uid] = st
         
-        # Reply with the menu (cannot edit user message)
         await show_time_menu(m, uid)
 
     # 3. Custom Date Input
     elif step == "waiting_custom_date":
         try:
-            # Parse format: 02-Feb 11:56 PM
             current_year = datetime.datetime.now(IST).year
-            # We add year to parsing to make it a valid object
             full_str = f"{current_year}-{text}"
             dt = datetime.datetime.strptime(full_str, "%Y-%d-%b %I:%M %p")
             dt = IST.localize(dt)
-            
-            # If date is in past (e.g. user typed Jan when it's Feb), maybe next year? 
-            # For now assume current year.
-            
             user_state[uid]["start_time"] = dt
             await ask_repetition(m, uid)
-            
         except ValueError:
-            await m.reply("❌ **Invalid Format!**\nUse: `02-Feb 11:56 PM`\n(Month is Case Sensitive: Jan, Feb, Mar)")
+            await m.reply("❌ **Invalid Format!**\nUse: `02-Feb 11:56 PM`")
 
-# --- UI MENUS (Auto-Edit Logic) ---
+# --- UI MENUS ---
 
 async def show_main_menu(m):
     kb = [[InlineKeyboardButton("📢 My Channels", callback_data="list_channels"), InlineKeyboardButton("➕ Add Channel", callback_data="add_channel")],
@@ -325,29 +328,24 @@ async def show_channel_options(uid, m, cid):
     await m.edit_text(f"⚙️ **Managing Channel**", reply_markup=InlineKeyboardMarkup(kb))
 
 async def show_time_menu(m, uid):
-    # This is "Step 2"
     kb = [
         [InlineKeyboardButton("🚀 Post Now", callback_data="time_0")],
         [InlineKeyboardButton("⏱️ +15 Mins", callback_data="time_15"), InlineKeyboardButton("🕐 +1 Hour", callback_data="time_60")],
-        [InlineKeyboardButton("📅 Custom Date", callback_data="time_custom")] # <--- NEW FEATURE
+        [InlineKeyboardButton("📅 Custom Date", callback_data="time_custom")]
     ]
     txt = "2️⃣ **When to post?**"
     if isinstance(m, Message): await m.reply(txt, reply_markup=InlineKeyboardMarkup(kb))
     else: await m.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
 
 async def ask_repetition(m, uid):
-    # This is "Step 3"
     kb = [
         [InlineKeyboardButton("🚫 No Repeat", callback_data="rep_0")],
         [InlineKeyboardButton("🔁 30 Mins", callback_data="rep_30"), InlineKeyboardButton("🔁 Hourly", callback_data="rep_60")],
         [InlineKeyboardButton("🔁 6 Hours", callback_data="rep_360"), InlineKeyboardButton("🔁 Daily", callback_data="rep_1440")],
-        [InlineKeyboardButton("🔙 Back", callback_data="step_time")] # <--- BACK BUTTON
+        [InlineKeyboardButton("🔙 Back", callback_data="step_time")]
     ]
-    
-    # Display selected time
     st = user_state[uid]
     time_str = st["start_time"].strftime("%d-%b %I:%M %p")
-    
     txt = f"3️⃣ **Repeat?**\nSelected Time: `{time_str}`"
     if isinstance(m, Message): await m.reply(txt, reply_markup=InlineKeyboardMarkup(kb))
     else: await m.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
@@ -364,9 +362,8 @@ async def ask_settings(m, uid):
         [InlineKeyboardButton(f"📌 Pin Msg: {pin_icon}", callback_data="toggle_pin")],
         [InlineKeyboardButton(f"🗑 Del Old: {del_icon}", callback_data="toggle_del")],
         [InlineKeyboardButton("➡️ Confirm", callback_data="goto_confirm")],
-        [InlineKeyboardButton("🔙 Back", callback_data="time_0")] # Rough back to time menu
+        [InlineKeyboardButton("🔙 Back", callback_data="time_0")]
     ]
-    
     txt = "4️⃣ **Settings**"
     if isinstance(m, Message): await m.reply(txt, reply_markup=InlineKeyboardMarkup(kb))
     else: await m.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
@@ -398,14 +395,12 @@ async def list_active_tasks(uid, m, cid):
             dt = datetime.datetime.fromisoformat(t["start_time"])
             time_str = dt.strftime('%d-%b %I:%M %p')
         except: time_str = "?"
-        
         txt += f"• `{time_str}` ({t['repeat_interval'] or 'Once'})\n"
         kb.append([InlineKeyboardButton(f"🗑 Delete {time_str}", callback_data=f"del_task_{t['task_id']}")])
-    
     kb.append([InlineKeyboardButton("🔙 Back", callback_data=f"ch_{cid}")])
     await m.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
 
-# --- WORKER & LOGIC (V9 Stable) ---
+# --- WORKER (With Premium Entity Support) ---
 async def create_task_logic(uid, q):
     st = user_state[uid]
     tid = f"task_{int(datetime.datetime.now().timestamp())}"
@@ -417,6 +412,7 @@ async def create_task_logic(uid, q):
         "content_type": st["content_type"],
         "content_text": st["content_text"],
         "file_id": st["file_id"],
+        "entities": st.get("entities"), # Pass the entities
         "pin": st["pin"],
         "delete_old": st["del"],
         "repeat_interval": st["interval"],
@@ -453,7 +449,7 @@ def add_scheduler_job(tid, t):
             async with Client(":memory:", api_id=API_ID, api_hash=API_HASH, session_string=session) as user:
                 target = int(t["chat_id"])
                 
-                # PEER RESOLUTION
+                # Peer Resolution
                 try: await user.get_chat(target)
                 except:
                     async for dialog in user.get_dialogs(limit=200):
@@ -464,18 +460,21 @@ def add_scheduler_job(tid, t):
                     try: await user.delete_messages(target, int(t["last_msg_id"]))
                     except: pass
                 
-                # 2. Send
+                # 2. Send (WITH ENTITIES)
                 sent = None
                 caption = t["content_text"]
+                # Parse entities back from string if they exist
+                entities = eval(t["entities"]) if t["entities"] and t["entities"] != "None" else None
+
                 try:
                     if t["content_type"] == "text":
-                        sent = await user.send_message(target, t["content_text"])
+                        sent = await user.send_message(target, t["content_text"], entities=entities)
                     elif t["content_type"] == "photo":
-                        sent = await user.send_photo(target, t["file_id"], caption=caption)
+                        sent = await user.send_photo(target, t["file_id"], caption=caption, caption_entities=entities)
                     elif t["content_type"] == "video":
-                        sent = await user.send_video(target, t["file_id"], caption=caption)
+                        sent = await user.send_video(target, t["file_id"], caption=caption, caption_entities=entities)
                     elif t["content_type"] == "document":
-                        sent = await user.send_document(target, t["file_id"], caption=caption)
+                        sent = await user.send_document(target, t["file_id"], caption=caption, caption_entities=entities)
                     elif t["content_type"] == "sticker":
                         sent = await user.send_sticker(target, t["file_id"])
                     
@@ -507,7 +506,7 @@ def add_scheduler_job(tid, t):
     
     scheduler.add_job(job_func, trigger, id=tid, replace_existing=True)
 
-# --- LOGIN (Standard) ---
+# --- LOGIN ---
 async def process_login(c, m, uid):
     st = login_state[uid]
     text = m.text.strip()
