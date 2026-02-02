@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ManagerBot")
 
 # --- INIT ---
-app = Client("manager_premium_v12", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("manager_clean_v13", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 scheduler = None 
 db_pool = None
 
@@ -42,8 +42,6 @@ async def init_db():
     async with pool.acquire() as conn:
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_sessions (user_id BIGINT PRIMARY KEY, session_string TEXT)''')
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_channels (user_id BIGINT, channel_id TEXT, title TEXT, PRIMARY KEY(user_id, channel_id))''')
-        
-        # Using V7 table (Supports Entities)
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_tasks_v7
                           (task_id TEXT PRIMARY KEY, owner_id BIGINT, chat_id TEXT, 
                            content_type TEXT, content_text TEXT, file_id TEXT, 
@@ -105,14 +103,13 @@ async def update_next_run(task_id, next_time_str):
     pool = await get_db()
     await pool.execute("UPDATE userbot_tasks_v7 SET start_time = $1 WHERE task_id = $2", next_time_str, task_id)
 
-# --- SERIALIZATION HELPERS (The Magic Fix) ---
-
+# --- SERIALIZATION ---
 def serialize_entities(entities_list):
     if not entities_list: return None
     data = []
     for e in entities_list:
         data.append({
-            "type": str(e.type), # e.g. "MessageEntityType.BOLD"
+            "type": str(e.type),
             "offset": e.offset,
             "length": e.length,
             "url": e.url,
@@ -127,11 +124,8 @@ def deserialize_entities(json_str):
         data = json.loads(json_str)
         entities = []
         for item in data:
-            # Convert string "MessageEntityType.BOLD" back to Enum
             type_str = item["type"].split(".")[-1] 
             e_type = getattr(enums.MessageEntityType, type_str)
-            
-            # Re-create the Real Object
             entity = MessageEntity(
                 type=e_type,
                 offset=item["offset"],
@@ -142,9 +136,7 @@ def deserialize_entities(json_str):
             )
             entities.append(entity)
         return entities
-    except Exception as e:
-        logger.error(f"Entity Parse Error: {e}")
-        return None
+    except: return None
 
 # --- BOT INTERFACE ---
 
@@ -155,7 +147,7 @@ async def start_cmd(c, m):
         await show_main_menu(m)
     else:
         await m.reply_text(
-            "👋 **Manager Bot V12 (Entities Fixed)**\n\nPlease login to start.",
+            "👋 **Manager Bot V13 (Auto-Clean Pin)**\n\nPlease login to start.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Login", callback_data="login_start")]])
         )
 
@@ -205,15 +197,9 @@ async def callback_router(c, q):
 
     elif d.startswith("time_"):
         offset = d.split("time_")[1] 
-        
         if offset == "custom":
             user_state[uid]["step"] = "waiting_custom_date"
-            await q.message.edit_text(
-                "📅 **Enter Custom Date**\n\n"
-                "Format: `02-Feb 11:56 PM`\n"
-                "Type it below 👇",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="step_time")]])
-            )
+            await q.message.edit_text("📅 **Enter Custom Date**\nFormat: `02-Feb 11:56 PM`", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="step_time")]]))
             return
 
         now = datetime.datetime.now(IST)
@@ -229,9 +215,7 @@ async def callback_router(c, q):
     elif d.startswith("rep_"):
         val = d.split("rep_")[1]
         interval = None
-        if val != "0":
-            interval = f"minutes={val}"
-        
+        if val != "0": interval = f"minutes={val}"
         user_state[uid]["interval"] = interval
         await ask_settings(q.message, uid)
 
@@ -281,15 +265,13 @@ async def handle_inputs(c, m):
             await add_channel(uid, str(chat.id), chat.title)
             user_state[uid] = None
             await m.reply(f"✅ Added **{chat.title}**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu", callback_data="menu_home")]]))
-        else:
-            await m.reply("❌ Invalid. Forward from a channel.")
+        else: await m.reply("❌ Invalid.")
 
     elif step == "waiting_content":
         content_type = "text"
         file_id = None
         content_text = m.text or m.caption or ""
         
-        # ✅ CAPTURE ENTITIES SAFELY
         raw_entities = m.entities or m.caption_entities
         entities_json = serialize_entities(raw_entities)
 
@@ -310,11 +292,10 @@ async def handle_inputs(c, m):
             "content_type": content_type,
             "content_text": content_text,
             "file_id": file_id,
-            "entities": entities_json, # Store JSON string
+            "entities": entities_json, 
             "step": "waiting_time"
         })
         user_state[uid] = st
-        
         await show_time_menu(m, uid)
 
     elif step == "waiting_custom_date":
@@ -325,8 +306,7 @@ async def handle_inputs(c, m):
             dt = IST.localize(dt)
             user_state[uid]["start_time"] = dt
             await ask_repetition(m, uid)
-        except ValueError:
-            await m.reply("❌ **Invalid Format!**\nUse: `02-Feb 11:56 PM`")
+        except: await m.reply("❌ Invalid Date.")
 
 # --- UI MENUS ---
 
@@ -429,7 +409,7 @@ async def list_active_tasks(uid, m, cid):
     kb.append([InlineKeyboardButton("🔙 Back", callback_data=f"ch_{cid}")])
     await m.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
 
-# --- WORKER ---
+# --- WORKER (With Clean Pin) ---
 async def create_task_logic(uid, q):
     st = user_state[uid]
     tid = f"task_{int(datetime.datetime.now().timestamp())}"
@@ -441,7 +421,7 @@ async def create_task_logic(uid, q):
         "content_type": st["content_type"],
         "content_text": st["content_text"],
         "file_id": st["file_id"],
-        "entities": st.get("entities"), # Already JSON
+        "entities": st.get("entities"), 
         "pin": st["pin"],
         "delete_old": st["del"],
         "repeat_interval": st["interval"],
@@ -492,8 +472,6 @@ def add_scheduler_job(tid, t):
                 # 2. Send (WITH RECONSTRUCTED ENTITIES)
                 sent = None
                 caption = t["content_text"]
-                
-                # ✅ RE-ANIMATE ENTITIES OBJECTS
                 entities_objs = deserialize_entities(t["entities"])
 
                 try:
@@ -514,8 +492,25 @@ def add_scheduler_job(tid, t):
 
                 if sent:
                     if t["pin"]:
-                        try: await sent.pin()
+                        try: 
+                            # ✅ CLEAN PIN LOGIC
+                            pinned_msg = await sent.pin()
+                            # Delete the service notification (e.g. "Channel pinned 'Hello'")
+                            # It is usually the message immediately following the sent one (ID + 1)
+                            # Or returned by the pin method if it's a service msg object
+                            
+                            # Method 1: Try deleting the service message returned by pin()
+                            if isinstance(pinned_msg, Message):
+                                await pinned_msg.delete()
+                            
+                            # Method 2: Fallback (Guess ID)
+                            # Sometimes pin() returns True (boolean).
+                            # In channels, the service message is separate.
+                            await asyncio.sleep(0.5)
+                            await user.delete_messages(target, sent.id + 1)
+                            
                         except: pass
+                    
                     await update_last_msg(tid, sent.id)
 
         except Exception as e:
