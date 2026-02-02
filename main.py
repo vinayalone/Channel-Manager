@@ -5,7 +5,7 @@ import datetime
 import pytz
 import asyncpg
 from pyrogram import Client, filters, idle, errors
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.date import DateTrigger
@@ -21,9 +21,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ManagerBot")
 
 # --- INIT ---
-app = Client("manager_final_v9", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
-# Scheduler starts as None. We bind it LATER in main().
+app = Client("manager_ui_v10", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 scheduler = None 
 db_pool = None
 
@@ -43,8 +41,6 @@ async def init_db():
     async with pool.acquire() as conn:
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_sessions (user_id BIGINT PRIMARY KEY, session_string TEXT)''')
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_channels (user_id BIGINT, channel_id TEXT, title TEXT, PRIMARY KEY(user_id, channel_id))''')
-        
-        # ✅ NEW TABLE v6 (Clean Slate)
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_tasks_v6
                           (task_id TEXT PRIMARY KEY, owner_id BIGINT, chat_id TEXT, 
                            content_type TEXT, content_text TEXT, file_id TEXT, 
@@ -80,9 +76,7 @@ async def del_channel(user_id, cid):
 async def save_task(t):
     pool = await get_db()
     await pool.execute("""
-        INSERT INTO userbot_tasks_v6
-        (task_id, owner_id, chat_id, content_type, content_text, file_id, pin, delete_old, repeat_interval, start_time, last_msg_id)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        INSERT INTO userbot_tasks_v6 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         ON CONFLICT (task_id) DO UPDATE SET last_msg_id = $11, start_time = $10
     """, t['task_id'], t['owner_id'], t['chat_id'], t['content_type'], t['content_text'], t['file_id'], 
        t['pin'], t['delete_old'], t['repeat_interval'], t['start_time'], t['last_msg_id'])
@@ -116,7 +110,7 @@ async def start_cmd(c, m):
         await show_main_menu(m)
     else:
         await m.reply_text(
-            "👋 **Manager Bot V9 (Deep Fix)**\n\nI schedule posts for you.\nFirst, I need to log in to your account.",
+            "👋 **Manager Bot**\n\nPlease login to start.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Login", callback_data="login_start")]])
         )
 
@@ -137,12 +131,14 @@ async def callback_router(c, q):
         await del_session(uid)
         await q.message.edit_text("👋 Logged out.")
 
+    # --- CHANNELS ---
     elif d == "list_channels":
         await show_channels(uid, q.message)
     
     elif d == "add_channel":
         user_state[uid] = {"step": "waiting_forward"}
-        await q.message.edit_text("📝 **Forward a message** from your channel to me now.")
+        await q.message.edit_text("📝 **Forward a message** from your channel to me now.", 
+                                  reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data="menu_home")]]))
     
     elif d.startswith("ch_"):
         cid = d.split("ch_")[1]
@@ -154,15 +150,32 @@ async def callback_router(c, q):
         await q.answer("Removed!")
         await show_channels(uid, q.message)
 
+    # --- POST CREATION FLOW ---
     elif d.startswith("new_"):
         cid = d.split("new_")[1]
         user_state[uid] = {"step": "waiting_content", "target": cid}
-        await q.message.edit_text("1️⃣ **Send the Post**\n(Text, Photo, Video, or Sticker)")
+        await q.message.edit_text("1️⃣ **Send the Post**\n(Text, Photo, Video, or Sticker)", 
+                                  reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data=f"ch_{cid}")]]))
+
+    # --- TIME SELECTION ---
+    elif d == "step_time":
+        await show_time_menu(q.message, uid)
 
     elif d.startswith("time_"):
         offset = d.split("time_")[1] 
-        now = datetime.datetime.now(IST)
         
+        if offset == "custom":
+            user_state[uid]["step"] = "waiting_custom_date"
+            await q.message.edit_text(
+                "📅 **Enter Custom Date**\n\n"
+                "Format: `02-Feb 11:56 PM`\n"
+                "Example: `05-Feb 02:30 PM`\n\n"
+                "Type it below 👇",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="step_time")]])
+            )
+            return
+
+        now = datetime.datetime.now(IST)
         if offset == "0":
             run_time = now + datetime.timedelta(seconds=5)
         else:
@@ -172,6 +185,7 @@ async def callback_router(c, q):
         user_state[uid]["start_time"] = run_time
         await ask_repetition(q.message, uid)
 
+    # --- REPETITION ---
     elif d.startswith("rep_"):
         val = d.split("rep_")[1]
         interval = None
@@ -181,6 +195,7 @@ async def callback_router(c, q):
         user_state[uid]["interval"] = interval
         await ask_settings(q.message, uid)
 
+    # --- SETTINGS & CONFIRM ---
     elif d in ["toggle_pin", "toggle_del"]:
         st = user_state[uid]
         st.setdefault("pin", True)
@@ -195,6 +210,7 @@ async def callback_router(c, q):
     elif d == "save_task":
         await create_task_logic(uid, q)
 
+    # --- TASK MANAGEMENT ---
     elif d.startswith("tasks_"):
         cid = d.split("tasks_")[1]
         await list_active_tasks(uid, q.message, cid)
@@ -207,7 +223,7 @@ async def callback_router(c, q):
         await q.answer("Task deleted")
         await show_main_menu(q.message)
 
-# --- INPUTS ---
+# --- MESSAGES & INPUTS ---
 
 @app.on_message(filters.private & ~filters.command("manage") & ~filters.command("start"))
 async def handle_inputs(c, m):
@@ -221,6 +237,7 @@ async def handle_inputs(c, m):
     st = user_state.get(uid, {})
     step = st.get("step")
 
+    # 1. Add Channel
     if step == "waiting_forward":
         if m.forward_from_chat:
             chat = m.forward_from_chat
@@ -228,8 +245,9 @@ async def handle_inputs(c, m):
             user_state[uid] = None
             await m.reply(f"✅ Added **{chat.title}**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu", callback_data="menu_home")]]))
         else:
-            await m.reply("❌ That's not a channel forward. Try again.")
+            await m.reply("❌ Invalid. Forward from a channel.")
 
+    # 2. Receive Content
     elif step == "waiting_content":
         content_type = "text"
         file_id = None
@@ -252,30 +270,45 @@ async def handle_inputs(c, m):
             "content_type": content_type,
             "content_text": content_text,
             "file_id": file_id,
-            "step": "waiting_time"
+            "step": "waiting_time" # Move to next step
         })
         user_state[uid] = st
         
-        kb = [
-            [InlineKeyboardButton("🚀 Post Now", callback_data="time_0")],
-            [InlineKeyboardButton("⏱️ +10 Mins", callback_data="time_10"), InlineKeyboardButton("🕐 +1 Hour", callback_data="time_60")],
-            [InlineKeyboardButton("🌙 +6 Hours", callback_data="time_360"), InlineKeyboardButton("📅 +24 Hours", callback_data="time_1440")]
-        ]
-        await m.reply("2️⃣ **When should I post this?**", reply_markup=InlineKeyboardMarkup(kb))
+        # Reply with the menu (cannot edit user message)
+        await show_time_menu(m, uid)
 
-# --- UI HELPERS ---
+    # 3. Custom Date Input
+    elif step == "waiting_custom_date":
+        try:
+            # Parse format: 02-Feb 11:56 PM
+            current_year = datetime.datetime.now(IST).year
+            # We add year to parsing to make it a valid object
+            full_str = f"{current_year}-{text}"
+            dt = datetime.datetime.strptime(full_str, "%Y-%d-%b %I:%M %p")
+            dt = IST.localize(dt)
+            
+            # If date is in past (e.g. user typed Jan when it's Feb), maybe next year? 
+            # For now assume current year.
+            
+            user_state[uid]["start_time"] = dt
+            await ask_repetition(m, uid)
+            
+        except ValueError:
+            await m.reply("❌ **Invalid Format!**\nUse: `02-Feb 11:56 PM`\n(Month is Case Sensitive: Jan, Feb, Mar)")
+
+# --- UI MENUS (Auto-Edit Logic) ---
 
 async def show_main_menu(m):
-    kb = [[InlineKeyboardButton("📢 My Channels", callback_data="list_channels"), InlineKeyboardButton("➕ Connect Channel", callback_data="add_channel")],
+    kb = [[InlineKeyboardButton("📢 My Channels", callback_data="list_channels"), InlineKeyboardButton("➕ Add Channel", callback_data="add_channel")],
           [InlineKeyboardButton("🚪 Logout", callback_data="logout")]]
-    txt = "👋 **Manager Dashboard**\nManage your channels easily."
+    txt = "👋 **Manager Dashboard**"
     if isinstance(m, Message): await m.reply(txt, reply_markup=InlineKeyboardMarkup(kb))
     else: await m.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
 
 async def show_channels(uid, m):
     chs = await get_channels(uid)
     if not chs:
-        await m.edit_text("❌ No channels connected.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Connect One", callback_data="add_channel")]]))
+        await m.edit_text("❌ No channels.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Add One", callback_data="add_channel")]]))
         return
     kb = []
     for c in chs: kb.append([InlineKeyboardButton(c['title'], callback_data=f"ch_{c['channel_id']}")])
@@ -286,38 +319,36 @@ async def show_channel_options(uid, m, cid):
     tasks = await get_user_tasks(uid, cid)
     kb = [
         [InlineKeyboardButton("✍️ Schedule Post", callback_data=f"new_{cid}")],
-        [InlineKeyboardButton(f"📅 View Active Tasks ({len(tasks)})", callback_data=f"tasks_{cid}")],
-        [InlineKeyboardButton("🗑 Unlink Channel", callback_data=f"rem_{cid}"), InlineKeyboardButton("🔙 Back", callback_data="list_channels")]
+        [InlineKeyboardButton(f"📅 Scheduled ({len(tasks)})", callback_data=f"tasks_{cid}")],
+        [InlineKeyboardButton("🗑 Unlink", callback_data=f"rem_{cid}"), InlineKeyboardButton("🔙 Back", callback_data="list_channels")]
     ]
     await m.edit_text(f"⚙️ **Managing Channel**", reply_markup=InlineKeyboardMarkup(kb))
 
-async def list_active_tasks(uid, m, cid):
-    tasks = await get_user_tasks(uid, cid)
-    if not tasks:
-        await m.edit_text("✅ No active tasks.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"ch_{cid}")]]))
-        return
-    txt = "**Active Tasks:**\n"
-    kb = []
-    for t in tasks:
-        try:
-            dt = datetime.datetime.fromisoformat(t["start_time"])
-            time_str = dt.strftime('%d-%b %I:%M %p')
-        except:
-            time_str = "Unknown"
-        
-        txt += f"• {t['content_type'].upper()} at `{time_str}`\n(Rep: {t['repeat_interval'] or 'No'})\n"
-        kb.append([InlineKeyboardButton("🗑 Delete Task", callback_data=f"del_task_{t['task_id']}")])
-    
-    kb.append([InlineKeyboardButton("🔙 Back", callback_data=f"ch_{cid}")])
-    await m.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
+async def show_time_menu(m, uid):
+    # This is "Step 2"
+    kb = [
+        [InlineKeyboardButton("🚀 Post Now", callback_data="time_0")],
+        [InlineKeyboardButton("⏱️ +15 Mins", callback_data="time_15"), InlineKeyboardButton("🕐 +1 Hour", callback_data="time_60")],
+        [InlineKeyboardButton("📅 Custom Date", callback_data="time_custom")] # <--- NEW FEATURE
+    ]
+    txt = "2️⃣ **When to post?**"
+    if isinstance(m, Message): await m.reply(txt, reply_markup=InlineKeyboardMarkup(kb))
+    else: await m.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
 
 async def ask_repetition(m, uid):
+    # This is "Step 3"
     kb = [
         [InlineKeyboardButton("🚫 No Repeat", callback_data="rep_0")],
         [InlineKeyboardButton("🔁 30 Mins", callback_data="rep_30"), InlineKeyboardButton("🔁 Hourly", callback_data="rep_60")],
-        [InlineKeyboardButton("🔁 6 Hours", callback_data="rep_360"), InlineKeyboardButton("🔁 Daily", callback_data="rep_1440")]
+        [InlineKeyboardButton("🔁 6 Hours", callback_data="rep_360"), InlineKeyboardButton("🔁 Daily", callback_data="rep_1440")],
+        [InlineKeyboardButton("🔙 Back", callback_data="step_time")] # <--- BACK BUTTON
     ]
-    txt = "3️⃣ **Should this repeat?**"
+    
+    # Display selected time
+    st = user_state[uid]
+    time_str = st["start_time"].strftime("%d-%b %I:%M %p")
+    
+    txt = f"3️⃣ **Repeat?**\nSelected Time: `{time_str}`"
     if isinstance(m, Message): await m.reply(txt, reply_markup=InlineKeyboardMarkup(kb))
     else: await m.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
 
@@ -332,10 +363,11 @@ async def ask_settings(m, uid):
     kb = [
         [InlineKeyboardButton(f"📌 Pin Msg: {pin_icon}", callback_data="toggle_pin")],
         [InlineKeyboardButton(f"🗑 Del Old: {del_icon}", callback_data="toggle_del")],
-        [InlineKeyboardButton("➡️ Next", callback_data="goto_confirm")]
+        [InlineKeyboardButton("➡️ Confirm", callback_data="goto_confirm")],
+        [InlineKeyboardButton("🔙 Back", callback_data="time_0")] # Rough back to time menu
     ]
     
-    txt = "4️⃣ **Post Settings**\nToggle options below:"
+    txt = "4️⃣ **Settings**"
     if isinstance(m, Message): await m.reply(txt, reply_markup=InlineKeyboardMarkup(kb))
     else: await m.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
 
@@ -344,15 +376,36 @@ async def confirm_task(m, uid):
     t_str = st["start_time"].strftime("%d-%b %I:%M %p")
     r_str = st["interval"] if st["interval"] else "Once"
     
-    txt = (f"✅ **Ready?**\n\n"
-           f"📢 Type: `{st['content_type']}`\n"
-           f"🕒 Time: `{t_str}`\n"
-           f"🔄 Repeat: `{r_str}`\n"
-           f"📌 Pin: {st['pin']} | 🗑 Del Old: {st['del']}")
+    txt = (f"✅ **Summary**\n"
+           f"📅 `{t_str}`\n"
+           f"🔁 `{r_str}`\n"
+           f"📌 Pin: {st['pin']} | 🗑 Del: {st['del']}")
     
-    kb = [[InlineKeyboardButton("✅ Confirm & Schedule", callback_data="save_task")]]
+    kb = [[InlineKeyboardButton("✅ Schedule It", callback_data="save_task")],
+          [InlineKeyboardButton("🔙 Edit", callback_data="time_0")]]
+    
     await m.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
 
+async def list_active_tasks(uid, m, cid):
+    tasks = await get_user_tasks(uid, cid)
+    if not tasks:
+        await m.edit_text("✅ No active tasks.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"ch_{cid}")]]))
+        return
+    txt = "**Active Tasks:**\n"
+    kb = []
+    for t in tasks:
+        try:
+            dt = datetime.datetime.fromisoformat(t["start_time"])
+            time_str = dt.strftime('%d-%b %I:%M %p')
+        except: time_str = "?"
+        
+        txt += f"• `{time_str}` ({t['repeat_interval'] or 'Once'})\n"
+        kb.append([InlineKeyboardButton(f"🗑 Delete {time_str}", callback_data=f"del_task_{t['task_id']}")])
+    
+    kb.append([InlineKeyboardButton("🔙 Back", callback_data=f"ch_{cid}")])
+    await m.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
+
+# --- WORKER & LOGIC (V9 Stable) ---
 async def create_task_logic(uid, q):
     st = user_state[uid]
     tid = f"task_{int(datetime.datetime.now().timestamp())}"
@@ -374,20 +427,16 @@ async def create_task_logic(uid, q):
     try:
         await save_task(task_data)
         add_scheduler_job(tid, task_data)
-        await q.message.edit_text("🎉 **Done!** Post scheduled.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu", callback_data="menu_home")]]))
+        await q.message.edit_text("🎉 **Scheduled!**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Home", callback_data="menu_home")]]))
     except Exception as e:
-        logger.error(f"Save Task Error: {e}")
-        await q.message.edit_text(f"❌ Error saving task: {e}")
+        logger.error(f"Save Error: {e}")
+        await q.message.edit_text(f"❌ Error: {e}")
 
-# --- WORKER (FIXED #4: DEEP PEER RESOLUTION) ---
 def add_scheduler_job(tid, t):
-    if scheduler is None:
-        logger.error(f"❌ SCHEDULER IS NONE. Job {tid} skipped.")
-        return
+    if scheduler is None: return
 
     async def job_func():
-        logger.info(f"🚀 JOB TRIGGERED: {tid} at {datetime.datetime.now(IST)}")
-        
+        logger.info(f"🚀 JOB {tid} TRIGGERED")
         next_run_iso = None
         if t["repeat_interval"]:
             try:
@@ -399,42 +448,25 @@ def add_scheduler_job(tid, t):
 
         try:
             session = await get_session(t["owner_id"])
-            if not session:
-                logger.error(f"❌ Job {tid}: No session found.")
-                return 
+            if not session: return 
             
             async with Client(":memory:", api_id=API_ID, api_hash=API_HASH, session_string=session) as user:
                 target = int(t["chat_id"])
                 
-                # ✅ V9 FIX: Forceful Peer Resolution
-                # We try to find the channel in the user's dialog list.
-                # 'limit=None' scans ALL chats. This fixes 'Peer Id Invalid'.
-                peer_resolved = False
-                try:
-                    await user.get_chat(target)
-                    peer_resolved = True
+                # PEER RESOLUTION
+                try: await user.get_chat(target)
                 except:
-                    logger.warning(f"⚠️ Job {tid}: Direct resolve failed. Scanning all dialogs...")
-                    async for dialog in user.get_dialogs(limit=200): # Scan last 200 chats
-                        if dialog.chat.id == target:
-                            logger.info(f"✅ Job {tid}: Found peer in dialogs!")
-                            peer_resolved = True
-                            break
+                    async for dialog in user.get_dialogs(limit=200):
+                        if dialog.chat.id == target: break
                 
-                if not peer_resolved:
-                    logger.error(f"❌ Job {tid}: Could not find channel {target} in dialogs.")
-                    # We continue anyway, maybe send_message will get lucky
-                
-                # 1. Delete Old Message
+                # 1. Del Old
                 if t["delete_old"] and t["last_msg_id"]:
-                    try: 
-                        await user.delete_messages(target, int(t["last_msg_id"]))
+                    try: await user.delete_messages(target, int(t["last_msg_id"]))
                     except: pass
                 
-                # 2. Send New Message
+                # 2. Send
                 sent = None
                 caption = t["content_text"]
-                
                 try:
                     if t["content_type"] == "text":
                         sent = await user.send_message(target, t["content_text"])
@@ -448,8 +480,8 @@ def add_scheduler_job(tid, t):
                         sent = await user.send_sticker(target, t["file_id"])
                     
                     logger.info(f"✅ Job {tid}: Message Sent! ID: {sent.id}")
-                except Exception as send_err:
-                    logger.error(f"❌ Job {tid} SEND ERROR: {send_err}")
+                except Exception as e:
+                    logger.error(f"❌ Job {tid} Fail: {e}")
 
                 if sent:
                     if t["pin"]:
@@ -458,19 +490,15 @@ def add_scheduler_job(tid, t):
                     await update_last_msg(tid, sent.id)
 
         except Exception as e:
-            logger.error(f"🔥 Job {tid} CRITICAL FAIL: {e}")
+            logger.error(f"🔥 Job {tid} Critical: {e}")
         
         finally:
-            # 3. UPDATE DB FOR NEXT RUN
             if next_run_iso:
-                try:
-                    await update_next_run(tid, next_run_iso)
-                    logger.info(f"🔄 Job {tid}: DB Updated for next run.")
+                try: await update_next_run(tid, next_run_iso)
                 except: pass
 
     dt = datetime.datetime.fromisoformat(t["start_time"])
     trigger = None
-    
     if t["repeat_interval"]:
         mins = int(t["repeat_interval"].split("=")[1])
         trigger = IntervalTrigger(start_date=dt, timezone=IST, minutes=mins)
@@ -479,21 +507,18 @@ def add_scheduler_job(tid, t):
     
     scheduler.add_job(job_func, trigger, id=tid, replace_existing=True)
 
-# --- LOGIN HELPERS ---
+# --- LOGIN (Standard) ---
 async def process_login(c, m, uid):
     st = login_state[uid]
     text = m.text.strip()
-    
     if st["step"] == "waiting_phone":
         try:
             temp = Client(":memory:", api_id=API_ID, api_hash=API_HASH)
             await temp.connect()
             sent = await temp.send_code(text)
             st.update({"client": temp, "phone": text, "hash": sent.phone_code_hash, "step": "waiting_code"})
-            await m.reply("📩 **Code sent!**\nSend it like: `12345`")
-        except Exception as e:
-            await m.reply(f"❌ Error: {e}")
-
+            await m.reply("📩 **Code?**")
+        except Exception as e: await m.reply(f"❌ {e}")
     elif st["step"] == "waiting_code":
         try:
             await st["client"].sign_in(st["phone"], st["hash"], text)
@@ -501,13 +526,11 @@ async def process_login(c, m, uid):
             await save_session(uid, sess)
             await st["client"].disconnect()
             del login_state[uid]
-            await m.reply("✅ **Success!**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Start Managing", callback_data="menu_home")]]))
+            await m.reply("✅ Logged In!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Go", callback_data="menu_home")]]))
         except errors.SessionPasswordNeeded:
             st["step"] = "waiting_pass"
-            await m.reply("🔐 **2FA Password required:**")
-        except Exception as e:
-            await m.reply(f"❌ Error: {e}")
-
+            await m.reply("🔐 **2FA Password?**")
+        except Exception as e: await m.reply(f"❌ {e}")
     elif st["step"] == "waiting_pass":
         try:
             await st["client"].check_password(text)
@@ -515,27 +538,20 @@ async def process_login(c, m, uid):
             await save_session(uid, sess)
             await st["client"].disconnect()
             del login_state[uid]
-            await m.reply("✅ **Success!**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Start Managing", callback_data="menu_home")]]))
-        except Exception as e:
-            await m.reply(f"❌ Error: {e}")
+            await m.reply("✅ Logged In!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Go", callback_data="menu_home")]]))
+        except Exception as e: await m.reply(f"❌ {e}")
 
-# --- STARTUP (FIX #3) ---
+# --- STARTUP ---
 async def main():
     await init_db()
-    
-    # ✅ FIX #3: Initialize Scheduler WITH RUNNING LOOP
     global scheduler
     scheduler = AsyncIOScheduler(timezone=IST, event_loop=asyncio.get_running_loop())
     scheduler.start()
-    
     try:
         tasks = await get_all_tasks()
-        logger.info(f"📂 Loaded {len(tasks)} tasks from DB")
-        for t in tasks:
-            add_scheduler_job(t['task_id'], t)
-    except Exception as e:
-        logger.error(f"Startup Logic Error: {e}")
-        
+        logger.info(f"📂 Loaded {len(tasks)} tasks")
+        for t in tasks: add_scheduler_job(t['task_id'], t)
+    except: pass
     await app.start()
     await idle()
     await app.stop()
