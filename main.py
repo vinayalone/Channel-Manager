@@ -21,7 +21,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ManagerBot")
 
 # --- INIT ---
-app = Client("manager_final_v8", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("manager_final_v8_clean", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # ✅ FIX #1: Scheduler starts as None. We bind it LATER in main().
 scheduler = None 
@@ -44,7 +44,7 @@ async def init_db():
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_sessions (user_id BIGINT PRIMARY KEY, session_string TEXT)''')
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_channels (user_id BIGINT, channel_id TEXT, title TEXT, PRIMARY KEY(user_id, channel_id))''')
         
-        # Using V5 table to ensure clean slate (no schema conflicts)
+        # Using V5 table to ensure clean slate
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_tasks_v5
                           (task_id TEXT PRIMARY KEY, owner_id BIGINT, chat_id TEXT, 
                            content_type TEXT, content_text TEXT, file_id TEXT, 
