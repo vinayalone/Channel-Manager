@@ -21,9 +21,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ManagerBot")
 
 # --- INIT ---
-app = Client("manager_final_v8_clean", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("manager_final_v9", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# ✅ FIX #1: Scheduler starts as None. We bind it LATER in main().
+# Scheduler starts as None. We bind it LATER in main().
 scheduler = None 
 db_pool = None
 
@@ -116,7 +116,7 @@ async def start_cmd(c, m):
         await show_main_menu(m)
     else:
         await m.reply_text(
-            "👋 **Manager Bot V8 (Final)**\n\nI schedule posts for you.\nFirst, I need to log in to your account.",
+            "👋 **Manager Bot V9**\n\nI schedule posts for you.\nFirst, I need to log in to your account.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Login", callback_data="login_start")]])
         )
 
@@ -379,11 +379,10 @@ async def create_task_logic(uid, q):
         logger.error(f"Save Task Error: {e}")
         await q.message.edit_text(f"❌ Error saving task: {e}")
 
-# --- WORKER ---
+# --- WORKER (FIXED PEER RESOLUTION) ---
 def add_scheduler_job(tid, t):
-    # ✅ FIX #2: Check if scheduler is ready (it should be now)
     if scheduler is None:
-        logger.error(f"❌ SCHEDULER IS NONE. Job {tid} skipped. Check initialization!")
+        logger.error(f"❌ SCHEDULER IS NONE. Job {tid} skipped.")
         return
 
     async def job_func():
@@ -407,9 +406,18 @@ def add_scheduler_job(tid, t):
             async with Client(":memory:", api_id=API_ID, api_hash=API_HASH, session_string=session) as user:
                 target = int(t["chat_id"])
                 
-                # Prevent Peer Id Invalid by caching access hash
-                try: await user.get_dialogs(limit=50)
-                except: pass
+                # ✅ FIX: AGGRESSIVE PEER RESOLUTION
+                # The issue is Pyrogram doesn't know the channel ID from a fresh session.
+                # We force it to fetch the chat details from the network.
+                try: 
+                    # Attempt to fetch the specific chat to cache the access hash
+                    await user.get_chat(target)
+                    logger.info(f"✅ Resolved Peer {target}")
+                except Exception as peer_err:
+                    logger.warning(f"⚠️ Direct resolve failed: {peer_err}. Trying dialogs...")
+                    # Fallback: Fetch ALL dialogs (slower but safer)
+                    try: await user.get_dialogs()
+                    except: pass
 
                 # 1. Delete Old Message
                 if t["delete_old"] and t["last_msg_id"]:
