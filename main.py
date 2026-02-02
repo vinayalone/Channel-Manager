@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ManagerBot")
 
 # --- INIT ---
-app = Client("manager_clean_v13", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("manager_audio_v14", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 scheduler = None 
 db_pool = None
 
@@ -147,7 +147,7 @@ async def start_cmd(c, m):
         await show_main_menu(m)
     else:
         await m.reply_text(
-            "👋 **Manager Bot V13 (Auto-Clean Pin)**\n\nPlease login to start.",
+            "👋 **Manager Bot V14 (Audio Support)**\n\nPlease login to start.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Login", callback_data="login_start")]])
         )
 
@@ -189,7 +189,7 @@ async def callback_router(c, q):
     elif d.startswith("new_"):
         cid = d.split("new_")[1]
         user_state[uid] = {"step": "waiting_content", "target": cid}
-        await q.message.edit_text("1️⃣ **Send the Post**\n(Text, Photo, Video, or Sticker)", 
+        await q.message.edit_text("1️⃣ **Send the Post**\n(Text, Photo, Audio, Voice, or Sticker)", 
                                   reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data=f"ch_{cid}")]]))
 
     elif d == "step_time":
@@ -267,6 +267,7 @@ async def handle_inputs(c, m):
             await m.reply(f"✅ Added **{chat.title}**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu", callback_data="menu_home")]]))
         else: await m.reply("❌ Invalid.")
 
+    # ✅ UPDATED: Audio & Voice Support
     elif step == "waiting_content":
         content_type = "text"
         file_id = None
@@ -281,6 +282,12 @@ async def handle_inputs(c, m):
         elif m.video:
             content_type = "video"
             file_id = m.video.file_id
+        elif m.audio: # <-- NEW
+            content_type = "audio"
+            file_id = m.audio.file_id
+        elif m.voice: # <-- NEW
+            content_type = "voice"
+            file_id = m.voice.file_id
         elif m.document:
             content_type = "document"
             file_id = m.document.file_id
@@ -409,7 +416,7 @@ async def list_active_tasks(uid, m, cid):
     kb.append([InlineKeyboardButton("🔙 Back", callback_data=f"ch_{cid}")])
     await m.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
 
-# --- WORKER (With Clean Pin) ---
+# --- WORKER ---
 async def create_task_logic(uid, q):
     st = user_state[uid]
     tid = f"task_{int(datetime.datetime.now().timestamp())}"
@@ -469,7 +476,7 @@ def add_scheduler_job(tid, t):
                     try: await user.delete_messages(target, int(t["last_msg_id"]))
                     except: pass
                 
-                # 2. Send (WITH RECONSTRUCTED ENTITIES)
+                # 2. Send (UPDATED FOR AUDIO)
                 sent = None
                 caption = t["content_text"]
                 entities_objs = deserialize_entities(t["entities"])
@@ -481,6 +488,12 @@ def add_scheduler_job(tid, t):
                         sent = await user.send_photo(target, t["file_id"], caption=caption, caption_entities=entities_objs)
                     elif t["content_type"] == "video":
                         sent = await user.send_video(target, t["file_id"], caption=caption, caption_entities=entities_objs)
+                    # ✅ NEW: Send Audio
+                    elif t["content_type"] == "audio":
+                        sent = await user.send_audio(target, t["file_id"], caption=caption, caption_entities=entities_objs)
+                    # ✅ NEW: Send Voice
+                    elif t["content_type"] == "voice":
+                        sent = await user.send_voice(target, t["file_id"], caption=caption, caption_entities=entities_objs)
                     elif t["content_type"] == "document":
                         sent = await user.send_document(target, t["file_id"], caption=caption, caption_entities=entities_objs)
                     elif t["content_type"] == "sticker":
@@ -493,22 +506,10 @@ def add_scheduler_job(tid, t):
                 if sent:
                     if t["pin"]:
                         try: 
-                            # ✅ CLEAN PIN LOGIC
                             pinned_msg = await sent.pin()
-                            # Delete the service notification (e.g. "Channel pinned 'Hello'")
-                            # It is usually the message immediately following the sent one (ID + 1)
-                            # Or returned by the pin method if it's a service msg object
-                            
-                            # Method 1: Try deleting the service message returned by pin()
-                            if isinstance(pinned_msg, Message):
-                                await pinned_msg.delete()
-                            
-                            # Method 2: Fallback (Guess ID)
-                            # Sometimes pin() returns True (boolean).
-                            # In channels, the service message is separate.
+                            if isinstance(pinned_msg, Message): await pinned_msg.delete()
                             await asyncio.sleep(0.5)
                             await user.delete_messages(target, sent.id + 1)
-                            
                         except: pass
                     
                     await update_last_msg(tid, sent.id)
