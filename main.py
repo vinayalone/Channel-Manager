@@ -10,7 +10,6 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.date import DateTrigger
-from apscheduler.executors.asyncio import AsyncIOExecutor
 
 # --- CONFIGURATION ---
 API_ID = int(os.environ.get("API_ID"))
@@ -23,9 +22,12 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ManagerBot")
 
 # --- INIT ---
-app = Client("manager_v18_final", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("manager_v19_final", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 scheduler = None 
 db_pool = None
+
+# ✅ STRICT MODE LOCK: Ensures jobs run one-by-one
+queue_lock = asyncio.Lock()
 
 # Global Cache
 login_state = {}
@@ -102,7 +104,6 @@ async def update_last_msg(task_id, msg_id):
     pool = await get_db()
     await pool.execute("UPDATE userbot_tasks_v7 SET last_msg_id = $1 WHERE task_id = $2", msg_id, task_id)
 
-# ✅ CRITICAL FIX: Fetch Dynamic Last Msg ID
 async def get_task_last_msg_id(task_id):
     pool = await get_db()
     return await pool.fetchval("SELECT last_msg_id FROM userbot_tasks_v7 WHERE task_id = $1", task_id)
@@ -155,7 +156,7 @@ async def start_cmd(c, m):
         await show_main_menu(m)
     else:
         await m.reply_text(
-            "👋 **Manager Bot V18**\n\nPlease login to start.",
+            "👋 **Manager Bot V19**\n\nPlease login to start.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Login", callback_data="login_start")]])
         )
 
@@ -512,88 +513,87 @@ def add_scheduler_job(tid, t):
     if scheduler is None: return
 
     async def job_func():
-        logger.info(f"🚀 JOB {tid} TRIGGERED")
-        next_run_iso = None
-        if t["repeat_interval"]:
-            try:
-                now = datetime.datetime.now(IST)
-                mins = int(t["repeat_interval"].split("=")[1])
-                next_run = now + datetime.timedelta(minutes=mins)
-                next_run_iso = next_run.isoformat()
-            except: pass
-
-        try:
-            session = await get_session(t["owner_id"])
-            if not session: return 
-            
-            async with Client(":memory:", api_id=API_ID, api_hash=API_HASH, session_string=session) as user:
-                target = int(t["chat_id"])
-                try: await user.get_chat(target)
-                except:
-                    async for dialog in user.get_dialogs(limit=200):
-                        if dialog.chat.id == target: break
-                
-                # ✅ FIX: Fetch REAL Last Msg ID from DB (Dynamic)
-                real_last_msg_id = await get_task_last_msg_id(t["task_id"])
-                
-                # 1. Del Old
-                if t["delete_old"] and real_last_msg_id:
-                    try: await user.delete_messages(target, int(real_last_msg_id))
-                    except: pass
-                
-                # 2. Send
-                sent = None
-                caption = t["content_text"]
-                
-                if t["content_type"] == "poll":
-                    poll_cfg = json.loads(t["entities"])
-                    try:
-                        sent = await user.send_poll(
-                            chat_id=target,
-                            question=caption,
-                            options=poll_cfg["options"],
-                            is_anonymous=poll_cfg["is_anonymous"],
-                            allows_multiple_answers=poll_cfg["allows_multiple_answers"]
-                        )
-                    except Exception as e: logger.error(f"Poll Error: {e}")
-                else:
-                    entities_objs = deserialize_entities(t["entities"])
-                    try:
-                        if t["content_type"] == "text":
-                            sent = await user.send_message(target, t["content_text"], entities=entities_objs)
-                        elif t["content_type"] == "photo":
-                            sent = await user.send_photo(target, t["file_id"], caption=caption, caption_entities=entities_objs)
-                        elif t["content_type"] == "video":
-                            sent = await user.send_video(target, t["file_id"], caption=caption, caption_entities=entities_objs)
-                        elif t["content_type"] == "audio":
-                            # ✅ AUDIO FIX
-                            sent = await user.send_audio(target, t["file_id"], caption=caption, caption_entities=entities_objs)
-                        elif t["content_type"] == "voice":
-                            sent = await user.send_voice(target, t["file_id"], caption=caption, caption_entities=entities_objs)
-                        elif t["content_type"] == "document":
-                            sent = await user.send_document(target, t["file_id"], caption=caption, caption_entities=entities_objs)
-                        elif t["content_type"] == "sticker":
-                            sent = await user.send_sticker(target, t["file_id"])
-                    except Exception as e: logger.error(f"Send Error: {e}")
-
-                if sent:
-                    logger.info(f"✅ Job {tid}: Message Sent! ID: {sent.id}")
-                    if t["pin"]:
-                        try: 
-                            pinned = await sent.pin()
-                            if isinstance(pinned, Message): await pinned.delete()
-                            await asyncio.sleep(0.5)
-                            await user.delete_messages(target, sent.id + 1)
-                        except: pass
-                    await update_last_msg(tid, sent.id)
-
-        except Exception as e:
-            logger.error(f"🔥 Job {tid} Critical: {e}")
-        
-        finally:
-            if next_run_iso:
-                try: await update_next_run(tid, next_run_iso)
+        # ✅ CRITICAL: Wait for lock to ensure strict order
+        async with queue_lock:
+            logger.info(f"🚀 JOB {tid} TRIGGERED")
+            next_run_iso = None
+            if t["repeat_interval"]:
+                try:
+                    now = datetime.datetime.now(IST)
+                    mins = int(t["repeat_interval"].split("=")[1])
+                    next_run = now + datetime.timedelta(minutes=mins)
+                    next_run_iso = next_run.isoformat()
                 except: pass
+
+            try:
+                session = await get_session(t["owner_id"])
+                if not session: return 
+                
+                async with Client(":memory:", api_id=API_ID, api_hash=API_HASH, session_string=session) as user:
+                    target = int(t["chat_id"])
+                    try: await user.get_chat(target)
+                    except:
+                        async for dialog in user.get_dialogs(limit=200):
+                            if dialog.chat.id == target: break
+                    
+                    # ✅ FIX: Get LATEST ID to delete
+                    real_last_msg_id = await get_task_last_msg_id(t["task_id"])
+                    
+                    if t["delete_old"] and real_last_msg_id:
+                        try: await user.delete_messages(target, int(real_last_msg_id))
+                        except: pass
+                    
+                    sent = None
+                    caption = t["content_text"]
+                    
+                    if t["content_type"] == "poll":
+                        poll_cfg = json.loads(t["entities"])
+                        try:
+                            sent = await user.send_poll(
+                                chat_id=target,
+                                question=caption,
+                                options=poll_cfg["options"],
+                                is_anonymous=poll_cfg["is_anonymous"],
+                                allows_multiple_answers=poll_cfg["allows_multiple_answers"]
+                            )
+                        except Exception as e: logger.error(f"Poll Error: {e}")
+                    else:
+                        entities_objs = deserialize_entities(t["entities"])
+                        try:
+                            if t["content_type"] == "text":
+                                sent = await user.send_message(target, t["content_text"], entities=entities_objs)
+                            elif t["content_type"] == "photo":
+                                sent = await user.send_photo(target, t["file_id"], caption=caption, caption_entities=entities_objs)
+                            elif t["content_type"] == "video":
+                                sent = await user.send_video(target, t["file_id"], caption=caption, caption_entities=entities_objs)
+                            elif t["content_type"] == "audio":
+                                sent = await user.send_audio(target, t["file_id"], caption=caption, caption_entities=entities_objs)
+                            elif t["content_type"] == "voice":
+                                sent = await user.send_voice(target, t["file_id"], caption=caption, caption_entities=entities_objs)
+                            elif t["content_type"] == "document":
+                                sent = await user.send_document(target, t["file_id"], caption=caption, caption_entities=entities_objs)
+                            elif t["content_type"] == "sticker":
+                                sent = await user.send_sticker(target, t["file_id"])
+                        except Exception as e: logger.error(f"Send Error: {e}")
+
+                    if sent:
+                        logger.info(f"✅ Job {tid}: Message Sent! ID: {sent.id}")
+                        if t["pin"]:
+                            try: 
+                                pinned = await sent.pin()
+                                if isinstance(pinned, Message): await pinned.delete()
+                                await asyncio.sleep(0.5)
+                                await user.delete_messages(target, sent.id + 1)
+                            except: pass
+                        await update_last_msg(tid, sent.id)
+
+            except Exception as e:
+                logger.error(f"🔥 Job {tid} Critical: {e}")
+            
+            finally:
+                if next_run_iso:
+                    try: await update_next_run(tid, next_run_iso)
+                    except: pass
 
     dt = datetime.datetime.fromisoformat(t["start_time"])
     trigger = None
@@ -643,15 +643,9 @@ async def process_login(c, m, uid):
 async def main():
     await init_db()
     
-    # ✅ STRICT MODE EXECUTOR (Prevents race conditions)
-    executors = { 'default': AsyncIOExecutor(max_workers=1) }
-    
+    # ✅ CORRECTED SCHEDULER INIT (Fixed Crash)
     global scheduler
-    scheduler = AsyncIOScheduler(
-        timezone=IST, 
-        event_loop=asyncio.get_running_loop(),
-        executors=executors
-    )
+    scheduler = AsyncIOScheduler(timezone=IST, event_loop=asyncio.get_running_loop())
     scheduler.start()
     
     try:
