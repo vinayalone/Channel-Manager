@@ -101,6 +101,11 @@ async def get_user_tasks(user_id, chat_id):
     pool = await get_db()
     return [dict(x) for x in await pool.fetch("SELECT * FROM userbot_tasks_v11 WHERE owner_id = $1 AND chat_id = $2", user_id, chat_id)]
 
+async def get_single_task(task_id):
+    pool = await get_db()
+    row = await pool.fetchrow("SELECT * FROM userbot_tasks_v11 WHERE task_id = $1", task_id)
+    return dict(row) if row else None
+
 async def delete_task(task_id):
     pool = await get_db()
     row = await pool.fetchrow("SELECT chat_id FROM userbot_tasks_v11 WHERE task_id = $1", task_id)
@@ -221,6 +226,37 @@ async def callback_router(c, q):
     elif d == "logout":
         await del_session(uid)
         await update_menu(q.message, "👋 **Logged out.**\n\nUse /start to login again.", None, uid)
+
+    # [NEW] 1. View Task Details
+    elif d.startswith("view_"):
+        tid = d.split("view_")[1]
+        await show_task_details(uid, q.message, tid)
+
+    # [NEW] 2. Preview Message (Sends to your private chat)
+    elif d.startswith("prev_"):
+        tid = d.split("prev_")[1]
+        task = await get_single_task(tid)
+        if task:
+            # Send copy to user to check formatting
+            await app.copy_message(chat_id=uid, from_chat_id=int(task['chat_id']), message_id=task['last_msg_id'])
+            await q.answer("✅ Preview sent to your private chat!")
+        else:
+            await q.answer("❌ Task not found.")
+
+    # [NEW] 3. Delete & Return to List
+    elif d.startswith("del_task_"):
+        tid = d.split("del_task_")[1]
+        try: scheduler.remove_job(tid)
+        except: pass
+        chat_id = await delete_task(tid)
+        await q.answer("🗑 Task Deleted!")
+        if chat_id: await list_active_tasks(uid, q.message, chat_id, force_new=False) # Return to list
+        else: await show_main_menu(q.message, uid)
+
+    # [NEW] 4. Back to List Button
+    elif d.startswith("back_list_"):
+        cid = d.split("back_list_")[1]
+        await list_active_tasks(uid, q.message, cid, force_new=False)
 
     # --- CHANNEL MANAGEMENT ---
     elif d == "list_channels":
@@ -563,17 +599,61 @@ async def list_active_tasks(uid, m, cid, force_new=False):
     if not tasks:
         await update_menu(m, "✅ No active tasks.", [[InlineKeyboardButton("🔙 Back", callback_data=f"ch_{cid}")]], uid, force_new)
         return
-    txt = "**Active Tasks:**\n"
+    
+    # Sort tasks by time (nearest first)
+    tasks.sort(key=lambda x: x['start_time'])
+    
+    txt = "**📅 Scheduled Tasks:**\nSelect one to manage:"
     kb = []
+    
+    type_icons = {"text": "📝", "photo": "📷", "video": "📹", "audio": "🎵", "poll": "📊"}
+    
     for t in tasks:
+        # Create a snippet (First 15 chars)
+        snippet = (t['content_text'] or "Media")[:15] + "..."
+        icon = type_icons.get(t['content_type'], "📁")
+        
+        # Format time
         try:
             dt = datetime.datetime.fromisoformat(t["start_time"])
-            time_str = dt.strftime('%d-%b %I:%M %p')
+            time_str = dt.strftime('%I:%M %p') # e.g., 02:30 PM
         except: time_str = "?"
-        txt += f"• `{time_str}` ({t['repeat_interval'] or 'Once'})\n"
-        kb.append([InlineKeyboardButton(f"🗑 Delete {time_str}", callback_data=f"del_task_{t['task_id']}")])
+        
+        # Button: [ 📝 Good morn... | 02:30 PM ]
+        btn_text = f"{icon} {snippet} | ⏰ {time_str}"
+        kb.append([InlineKeyboardButton(btn_text, callback_data=f"view_{t['task_id']}")])
+        
     kb.append([InlineKeyboardButton("🔙 Back", callback_data=f"ch_{cid}")])
     await update_menu(m, txt, kb, uid, force_new)
+
+async def show_task_details(uid, m, tid):
+    t = await get_single_task(tid)
+    if not t:
+        await update_menu(m, "❌ Task not found (maybe deleted).", [[InlineKeyboardButton("🏠 Home", callback_data="menu_home")]], uid)
+        return
+
+    # Format Data
+    dt = datetime.datetime.fromisoformat(t["start_time"])
+    time_str = dt.strftime('%d-%b %I:%M %p')
+    type_map = {"text": "📝 Text", "photo": "📷 Photo", "video": "📹 Video", "audio": "🎵 Audio", "poll": "📊 Poll"}
+    type_str = type_map.get(t['content_type'], "📁 File")
+    
+    txt = (f"⚙️ **Managing Task**\n\n"
+           f"📝 **Snippet:** `{t['content_text'][:50]}...`\n"
+           f"📂 **Type:** {type_str}\n"
+           f"📅 **Time:** `{time_str}`\n"
+           f"🔁 **Repeat:** `{t['repeat_interval'] or 'No'}`\n\n"
+           f"👇 **Select Action:**")
+
+    kb = [
+        # The "Preview" Feature
+        # Note: Previewing requires the bot to copy the message. 
+        # If 'last_msg_id' isn't saved yet (not posted yet), we can't preview easily without re-uploading.
+        # So we only show Delete/Back for now unless you want advanced preview logic.
+        [InlineKeyboardButton("🗑 Delete Task", callback_data=f"del_task_{tid}")],
+        [InlineKeyboardButton("🔙 Back to List", callback_data=f"back_list_{t['chat_id']}")]
+    ]
+    await update_menu(m, txt, kb, uid)
 
 # --- WORKER ---
 async def create_task_logic(uid, q):
@@ -674,24 +754,27 @@ def add_scheduler_job(tid, t):
                                 sent = await user.send_photo(target, t["file_id"], caption=caption, caption_entities=entities_objs)
                             elif t["content_type"] == "video":
                                 sent = await user.send_video(target, t["file_id"], caption=caption, caption_entities=entities_objs)
-                            # ✅ FIXED: Correct Audio/Voice Handling
-                            # ✅ PASTE THIS FIX ✅
-                            # Audio/Voice must be downloaded by Bot (app) and re-uploaded by User (user)
                             elif t["content_type"] in ["audio", "voice"]:
                                 try:
-                                    # 1. Bot downloads the file
-                                    logger.info(f"📥 Downloading media {t['file_id']}...")
-                                    file_bytes = await app.download_media(t["file_id"], in_memory=True)
-                                    bio = BytesIO(file_bytes)
-                                    bio.name = "voice.ogg" if t["content_type"] == "voice" else "audio.mp3"
+                                    # ✅ CORRECTED: app.download_media returns BytesIO directly when in_memory=True
+                                    logger.info(f"📥 Downloading {t['content_type']} {t['file_id']}...")
+                                    media_file = await app.download_media(t["file_id"], in_memory=True)
                                     
-                                    # 2. Userbot uploads it
-                                    if t["content_type"] == "audio":
-                                        sent = await user.send_audio(target, bio, caption=caption, caption_entities=entities_objs)
-                                    else:
-                                        sent = await user.send_voice(target, bio, caption=caption, caption_entities=entities_objs)
+                                    if not media_file:
+                                        logger.error(f"❌ Download failed for {t['file_id']}")
+                                        return
+                                    
+                                    # ✅ BytesIO is ready - set name for proper detection
+                                    if t["content_type"] == "voice":
+                                        media_file.name = "voice.ogg"
+                                        sent = await user.send_voice(target, media_file, caption=caption)
+                                    else:  # audio
+                                        media_file.name = "audio.m4a"  # or "audio.mp3"
+                                        sent = await user.send_audio(target, media_file, caption=caption, caption_entities=entities_objs)
+                                        
                                 except Exception as e:
-                                    logger.error(f"❌ Audio Upload Failed: {e}")
+                                    logger.error(f"❌ Audio/Voice Error: {e}")
+                                    
                             elif t["content_type"] == "document":
                                 sent = await user.send_document(target, t["file_id"], caption=caption, caption_entities=entities_objs)
                             elif t["content_type"] == "sticker":
