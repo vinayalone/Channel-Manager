@@ -75,13 +75,18 @@ async def get_channels(user_id):
     return await pool.fetch("SELECT * FROM userbot_channels WHERE user_id = $1", user_id)
 
 async def del_channel(user_id, cid):
-    pool = await get_db()
+    pool = await get_db() 
+    # 1. Find all tasks scheduled for this channel
     tasks = await pool.fetch("SELECT task_id FROM userbot_tasks_v11 WHERE chat_id = $1", cid)
+    # 2. Stop them in the Scheduler (Stop sending messages)
     if scheduler:
         for t in tasks:
-            try: scheduler.remove_job(t['task_id'])
-            except: pass
+            try: 
+                scheduler.remove_job(t['task_id'])
+            except: pass 
+    # 3. Delete the Tasks from the Database
     await pool.execute("DELETE FROM userbot_tasks_v11 WHERE chat_id = $1", cid)
+    # 4. Finally, Delete the Channel itself
     await pool.execute("DELETE FROM userbot_channels WHERE user_id = $1 AND channel_id = $2", user_id, cid)
 
 async def save_task(t):
