@@ -10,6 +10,7 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.date import DateTrigger
+from apscheduler.executors.asyncio import AsyncIOExecutor
 
 # --- CONFIGURATION ---
 API_ID = int(os.environ.get("API_ID"))
@@ -22,11 +23,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ManagerBot")
 
 # --- INIT ---
-app = Client("manager_v19_final", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("manager_v20_master", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 scheduler = None 
 db_pool = None
-
-# ✅ STRICT MODE LOCK: Ensures jobs run one-by-one
 queue_lock = asyncio.Lock()
 
 # Global Cache
@@ -74,8 +73,20 @@ async def get_channels(user_id):
     pool = await get_db()
     return await pool.fetch("SELECT * FROM userbot_channels WHERE user_id = $1", user_id)
 
+# ✅ FIX 1: Unlinking now nukes all tasks for that channel
 async def del_channel(user_id, cid):
     pool = await get_db()
+    # 1. Get all task IDs for this channel
+    tasks = await pool.fetch("SELECT task_id FROM userbot_tasks_v7 WHERE chat_id = $1", cid)
+    
+    # 2. Kill them from Scheduler
+    if scheduler:
+        for t in tasks:
+            try: scheduler.remove_job(t['task_id'])
+            except: pass
+            
+    # 3. Delete from DB
+    await pool.execute("DELETE FROM userbot_tasks_v7 WHERE chat_id = $1", cid)
     await pool.execute("DELETE FROM userbot_channels WHERE user_id = $1 AND channel_id = $2", user_id, cid)
 
 async def save_task(t):
@@ -156,7 +167,7 @@ async def start_cmd(c, m):
         await show_main_menu(m)
     else:
         await m.reply_text(
-            "👋 **Manager Bot V19**\n\nPlease login to start.",
+            "👋 **Manager Bot V20**\n\nPlease login to start.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Login", callback_data="login_start")]])
         )
 
@@ -192,7 +203,8 @@ async def callback_router(c, q):
     elif d.startswith("rem_"):
         cid = d.split("rem_")[1]
         await del_channel(uid, cid)
-        await q.answer("Removed!")
+        # ✅ FIX: Single Message Update after Unlink
+        await q.answer("Channel Unlinked & Tasks Deleted!")
         await show_channels(uid, q.message)
 
     elif d.startswith("new_"):
@@ -202,9 +214,17 @@ async def callback_router(c, q):
         await q.message.edit_text("1️⃣ **Send the Post**\n(Text, Photo, Audio, Poll, etc)", 
                                   reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Cancel", callback_data=f"ch_{cid}")]]))
 
+    # --- WIZARD NAVIGATION (BACK BUTTONS) ---
     elif d == "step_time":
         await show_time_menu(q.message, uid)
+    
+    elif d == "step_rep":
+        await ask_repetition(q.message, uid)
+        
+    elif d == "step_settings":
+        await ask_settings(q.message, uid)
 
+    # --- TIME ---
     elif d.startswith("time_"):
         offset = d.split("time_")[1] 
         if offset == "custom":
@@ -222,6 +242,7 @@ async def callback_router(c, q):
         user_state[uid]["start_time"] = run_time
         await ask_repetition(q.message, uid)
 
+    # --- REPEAT ---
     elif d.startswith("rep_"):
         val = d.split("rep_")[1]
         interval = None
@@ -229,6 +250,7 @@ async def callback_router(c, q):
         user_state[uid]["interval"] = interval
         await ask_settings(q.message, uid)
 
+    # --- SETTINGS ---
     elif d in ["toggle_pin", "toggle_del"]:
         st = user_state[uid]
         st.setdefault("pin", True)
@@ -331,6 +353,7 @@ async def handle_inputs(c, m):
         try: await m.delete()
         except: pass
         
+        # Single Message Update
         if "menu_msg_id" in st:
             try:
                 await app.edit_message_text(
@@ -390,21 +413,26 @@ async def show_channel_options(uid, m, cid):
     await m.edit_text(f"⚙️ **Managing Channel**", reply_markup=InlineKeyboardMarkup(kb))
 
 async def show_time_menu(m, uid):
+    # ✅ FIX: BACK BUTTON to Channel Options
+    cid = user_state[uid].get("target")
     kb = [
         [InlineKeyboardButton("🚀 Post Now", callback_data="time_0")],
         [InlineKeyboardButton("⏱️ +15 Mins", callback_data="time_15"), InlineKeyboardButton("🕐 +1 Hour", callback_data="time_60")],
-        [InlineKeyboardButton("📅 Custom Date", callback_data="time_custom")]
+        [InlineKeyboardButton("📅 Custom Date", callback_data="time_custom")],
+        [InlineKeyboardButton("🔙 Back", callback_data=f"ch_{cid}")] # <--- GOES BACK TO CHANNEL
     ]
     txt = "2️⃣ **When to post?**"
     if isinstance(m, Message): await m.reply(txt, reply_markup=InlineKeyboardMarkup(kb))
     else: await m.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
 
 async def ask_repetition(m, uid):
+    # ✅ FIX: Added 5 Mins option
     kb = [
         [InlineKeyboardButton("🚫 No Repeat", callback_data="rep_0")],
-        [InlineKeyboardButton("🔁 30 Mins", callback_data="rep_30"), InlineKeyboardButton("🔁 Hourly", callback_data="rep_60")],
-        [InlineKeyboardButton("🔁 6 Hours", callback_data="rep_360"), InlineKeyboardButton("🔁 Daily", callback_data="rep_1440")],
-        [InlineKeyboardButton("🔙 Back", callback_data="step_time")]
+        [InlineKeyboardButton("🔁 5 Mins", callback_data="rep_5"), InlineKeyboardButton("🔁 30 Mins", callback_data="rep_30")],
+        [InlineKeyboardButton("🔁 Hourly", callback_data="rep_60"), InlineKeyboardButton("🔁 6 Hours", callback_data="rep_360")],
+        [InlineKeyboardButton("🔁 Daily", callback_data="rep_1440")],
+        [InlineKeyboardButton("🔙 Back", callback_data="step_time")] # <--- GOES BACK TO TIME
     ]
     st = user_state[uid]
     time_str = st["start_time"].strftime("%d-%b %I:%M %p")
@@ -424,7 +452,7 @@ async def ask_settings(m, uid):
         [InlineKeyboardButton(f"📌 Pin Msg: {pin_icon}", callback_data="toggle_pin")],
         [InlineKeyboardButton(f"🗑 Del Old: {del_icon}", callback_data="toggle_del")],
         [InlineKeyboardButton("➡️ Confirm", callback_data="goto_confirm")],
-        [InlineKeyboardButton("🔙 Back", callback_data="time_0")]
+        [InlineKeyboardButton("🔙 Back", callback_data="step_rep")] # <--- GOES BACK TO REPEAT
     ]
     txt = "4️⃣ **Settings**"
     if isinstance(m, Message): await m.reply(txt, reply_markup=InlineKeyboardMarkup(kb))
@@ -442,7 +470,7 @@ async def confirm_task(m, uid):
            f"📌 Pin: {st['pin']} | 🗑 Del: {st['del']}")
     
     kb = [[InlineKeyboardButton("✅ Schedule It", callback_data="save_task")],
-          [InlineKeyboardButton("🔙 Edit", callback_data="time_0")]]
+          [InlineKeyboardButton("🔙 Back", callback_data="step_settings")]] # <--- GOES BACK TO SETTINGS
     
     await m.edit_text(txt, reply_markup=InlineKeyboardMarkup(kb))
 
@@ -513,7 +541,6 @@ def add_scheduler_job(tid, t):
     if scheduler is None: return
 
     async def job_func():
-        # ✅ CRITICAL: Wait for lock to ensure strict order
         async with queue_lock:
             logger.info(f"🚀 JOB {tid} TRIGGERED")
             next_run_iso = None
@@ -536,7 +563,6 @@ def add_scheduler_job(tid, t):
                         async for dialog in user.get_dialogs(limit=200):
                             if dialog.chat.id == target: break
                     
-                    # ✅ FIX: Get LATEST ID to delete
                     real_last_msg_id = await get_task_last_msg_id(t["task_id"])
                     
                     if t["delete_old"] and real_last_msg_id:
@@ -642,12 +668,10 @@ async def process_login(c, m, uid):
 # --- STARTUP ---
 async def main():
     await init_db()
-    
-    # ✅ CORRECTED SCHEDULER INIT (Fixed Crash)
+    executors = { 'default': AsyncIOExecutor() }
     global scheduler
-    scheduler = AsyncIOScheduler(timezone=IST, event_loop=asyncio.get_running_loop())
+    scheduler = AsyncIOScheduler(timezone=IST, event_loop=asyncio.get_running_loop(), executors=executors)
     scheduler.start()
-    
     try:
         tasks = await get_all_tasks()
         logger.info(f"📂 Loaded {len(tasks)} tasks")
