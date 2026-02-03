@@ -640,7 +640,7 @@ async def create_task_logic(uid, q):
                      f"🔁 **Repeat:** `{st['interval'] or 'No'}`\n\n"
                      f"👉 Click /manage to schedule more.")
         
-        await update_menu(q.message, final_txt, None, uid, force_new=True)
+        await update_menu(q.message, final_txt, None, uid, force_new=False)
     except Exception as e:
         logger.error(f"Save Error: {e}")
         await q.message.edit_text(f"❌ Error: {e}")
