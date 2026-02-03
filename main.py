@@ -23,7 +23,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ManagerBot")
 
 # --- INIT ---
-app = Client("manager_v22_single_ui", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("manager_v24_pro", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 scheduler = None 
 db_pool = None
 queue_lock = asyncio.Lock()
@@ -44,8 +44,7 @@ async def init_db():
     async with pool.acquire() as conn:
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_sessions (user_id BIGINT PRIMARY KEY, session_string TEXT)''')
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_channels (user_id BIGINT, channel_id TEXT, title TEXT, PRIMARY KEY(user_id, channel_id))''')
-        # V8 Table (Clean Slate)
-        await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_tasks_v8
+        await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_tasks_v9
                           (task_id TEXT PRIMARY KEY, owner_id BIGINT, chat_id TEXT, 
                            content_type TEXT, content_text TEXT, file_id TEXT, 
                            entities TEXT, 
@@ -76,49 +75,47 @@ async def get_channels(user_id):
 
 async def del_channel(user_id, cid):
     pool = await get_db()
-    # 1. Kill tasks from Scheduler
-    tasks = await pool.fetch("SELECT task_id FROM userbot_tasks_v8 WHERE chat_id = $1", cid)
+    tasks = await pool.fetch("SELECT task_id FROM userbot_tasks_v9 WHERE chat_id = $1", cid)
     if scheduler:
         for t in tasks:
             try: scheduler.remove_job(t['task_id'])
             except: pass
-    # 2. Delete from DB
-    await pool.execute("DELETE FROM userbot_tasks_v8 WHERE chat_id = $1", cid)
+    await pool.execute("DELETE FROM userbot_tasks_v9 WHERE chat_id = $1", cid)
     await pool.execute("DELETE FROM userbot_channels WHERE user_id = $1 AND channel_id = $2", user_id, cid)
 
 async def save_task(t):
     pool = await get_db()
     await pool.execute("""
-        INSERT INTO userbot_tasks_v8 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        INSERT INTO userbot_tasks_v9 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
         ON CONFLICT (task_id) DO UPDATE SET last_msg_id = $12, start_time = $11
     """, t['task_id'], t['owner_id'], t['chat_id'], t['content_type'], t['content_text'], t['file_id'], 
        t['entities'], t['pin'], t['delete_old'], t['repeat_interval'], t['start_time'], t['last_msg_id'])
 
 async def get_all_tasks():
     pool = await get_db()
-    return [dict(x) for x in await pool.fetch("SELECT * FROM userbot_tasks_v8")]
+    return [dict(x) for x in await pool.fetch("SELECT * FROM userbot_tasks_v9")]
 
 async def get_user_tasks(user_id, chat_id):
     pool = await get_db()
-    return [dict(x) for x in await pool.fetch("SELECT * FROM userbot_tasks_v8 WHERE owner_id = $1 AND chat_id = $2", user_id, chat_id)]
+    return [dict(x) for x in await pool.fetch("SELECT * FROM userbot_tasks_v9 WHERE owner_id = $1 AND chat_id = $2", user_id, chat_id)]
 
 async def delete_task(task_id):
     pool = await get_db()
-    row = await pool.fetchrow("SELECT chat_id FROM userbot_tasks_v8 WHERE task_id = $1", task_id)
-    await pool.execute("DELETE FROM userbot_tasks_v8 WHERE task_id = $1", task_id)
+    row = await pool.fetchrow("SELECT chat_id FROM userbot_tasks_v9 WHERE task_id = $1", task_id)
+    await pool.execute("DELETE FROM userbot_tasks_v9 WHERE task_id = $1", task_id)
     return row['chat_id'] if row else None
 
 async def update_last_msg(task_id, msg_id):
     pool = await get_db()
-    await pool.execute("UPDATE userbot_tasks_v8 SET last_msg_id = $1 WHERE task_id = $2", msg_id, task_id)
+    await pool.execute("UPDATE userbot_tasks_v9 SET last_msg_id = $1 WHERE task_id = $2", msg_id, task_id)
 
 async def get_task_last_msg_id(task_id):
     pool = await get_db()
-    return await pool.fetchval("SELECT last_msg_id FROM userbot_tasks_v8 WHERE task_id = $1", task_id)
+    return await pool.fetchval("SELECT last_msg_id FROM userbot_tasks_v9 WHERE task_id = $1", task_id)
 
 async def update_next_run(task_id, next_time_str):
     pool = await get_db()
-    await pool.execute("UPDATE userbot_tasks_v8 SET start_time = $1 WHERE task_id = $2", next_time_str, task_id)
+    await pool.execute("UPDATE userbot_tasks_v9 SET start_time = $1 WHERE task_id = $2", next_time_str, task_id)
 
 # --- SERIALIZATION ---
 def serialize_entities(entities_list):
@@ -126,12 +123,8 @@ def serialize_entities(entities_list):
     data = []
     for e in entities_list:
         data.append({
-            "type": str(e.type),
-            "offset": e.offset,
-            "length": e.length,
-            "url": e.url,
-            "language": e.language,
-            "custom_emoji_id": e.custom_emoji_id
+            "type": str(e.type), "offset": e.offset, "length": e.length,
+            "url": e.url, "language": e.language, "custom_emoji_id": e.custom_emoji_id
         })
     return json.dumps(data)
 
@@ -144,41 +137,28 @@ def deserialize_entities(json_str):
             type_str = item["type"].split(".")[-1] 
             e_type = getattr(enums.MessageEntityType, type_str)
             entity = MessageEntity(
-                type=e_type,
-                offset=item["offset"],
-                length=item["length"],
-                url=item["url"],
-                language=item["language"],
-                custom_emoji_id=item["custom_emoji_id"]
+                type=e_type, offset=item["offset"], length=item["length"],
+                url=item["url"], language=item["language"], custom_emoji_id=item["custom_emoji_id"]
             )
             entities.append(entity)
         return entities
     except: return None
 
-# --- UI HELPER: THE MAGIC FIX ---
+# --- UI HELPER: SINGLE MSG ---
 async def safe_edit(m, text, kb, uid):
-    """Smartly edits the active menu message instead of sending new ones."""
-    markup = InlineKeyboardMarkup(kb)
+    """Edits the active menu message. If deleted, sends a new one."""
+    markup = InlineKeyboardMarkup(kb) if kb else None
     
-    # Try to get the saved menu message ID
     st = user_state.get(uid, {})
     menu_id = st.get("menu_msg_id")
     chat_id = m.chat.id
 
-    # If we have a stored menu ID, try to edit it
     if menu_id:
         try:
-            await app.edit_message_text(
-                chat_id=chat_id,
-                message_id=menu_id,
-                text=text,
-                reply_markup=markup
-            )
-            return # Success!
-        except Exception:
-            pass # Failed (maybe user deleted it), so we send a new one
+            await app.edit_message_text(chat_id, menu_id, text, reply_markup=markup)
+            return
+        except: pass 
 
-    # Fallback: Send new message and save its ID
     sent = await app.send_message(chat_id, text, reply_markup=markup)
     if uid in user_state:
         user_state[uid]["menu_msg_id"] = sent.id
@@ -188,22 +168,18 @@ async def safe_edit(m, text, kb, uid):
 @app.on_message(filters.command("manage") | filters.command("start"))
 async def start_cmd(c, m):
     uid = m.from_user.id
+    if uid not in user_state: user_state[uid] = {}
+    
     if await get_session(uid):
-        # Reset menu ID on start to force a fresh message
-        if uid in user_state: user_state[uid]["menu_msg_id"] = None
-        
-        # We manually send the first message to capture ID
         kb = [[InlineKeyboardButton("📢 My Channels", callback_data="list_channels"), InlineKeyboardButton("➕ Add Channel", callback_data="add_channel")],
               [InlineKeyboardButton("🚪 Logout", callback_data="logout")]]
-        sent = await m.reply("👋 **Manager Dashboard**", reply_markup=InlineKeyboardMarkup(kb))
-        
-        # Init state if needed
-        if uid not in user_state: user_state[uid] = {}
+        sent = await m.reply("👋 **Manager Dashboard**\n\nWelcome back, Admin.", reply_markup=InlineKeyboardMarkup(kb))
         user_state[uid]["menu_msg_id"] = sent.id
     else:
+        # Professional Login Prompt
         await m.reply_text(
-            "👋 **Manager Bot V22**\n\nPlease login to start.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Login", callback_data="login_start")]])
+            "👋 **Welcome to Manager Bot**\n\nI can schedule posts, polls, and media.\n\n👇 **Click Login to begin setup.**",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Login Account", callback_data="login_start")]])
         )
 
 @app.on_callback_query()
@@ -211,29 +187,29 @@ async def callback_router(c, q):
     uid = q.from_user.id
     d = q.data
 
-    # Ensure state exists
     if uid not in user_state: user_state[uid] = {}
-    # Update menu_id from the callback message itself (most reliable)
     user_state[uid]["menu_msg_id"] = q.message.id
 
     if d == "menu_home":
         user_state[uid]["step"] = None
         await show_main_menu(q.message, uid)
     
+    # --- PRO LOGIN FLOW ---
     elif d == "login_start":
         login_state[uid] = {"step": "waiting_phone"}
-        await q.message.edit_text("📱 **Send Phone Number**\nFormat: `+1234567890`")
+        await safe_edit(q.message, "📱 **Step 1: Phone Number**\n\nPlease enter your Telegram phone number with country code.\n\nExample: `+919876543210`", [[InlineKeyboardButton("🔙 Cancel", callback_data="menu_home")]], uid)
     
     elif d == "logout":
         await del_session(uid)
-        await q.message.edit_text("👋 Logged out.")
+        await safe_edit(q.message, "👋 **Logged out.**\n\nUse /start to login again.", None, uid)
 
+    # --- CHANNEL MANAGEMENT ---
     elif d == "list_channels":
         await show_channels(uid, q.message)
     
     elif d == "add_channel":
         user_state[uid]["step"] = "waiting_forward"
-        await safe_edit(q.message, "📝 **Forward a message** from your channel to me now.", 
+        await safe_edit(q.message, "📝 **Step 2: Add Channel**\n\nForward a message from your channel to this chat now.\nI will detect the ID automatically.", 
                         [[InlineKeyboardButton("🔙 Cancel", callback_data="menu_home")]], uid)
     
     elif d.startswith("ch_"):
@@ -249,7 +225,7 @@ async def callback_router(c, q):
     elif d.startswith("new_"):
         cid = d.split("new_")[1]
         user_state[uid].update({"step": "waiting_content", "target": cid})
-        await safe_edit(q.message, "1️⃣ **Send the Post**\n(Text, Photo, Audio, Poll, etc)", 
+        await safe_edit(q.message, "1️⃣ **Create Post**\n\nSend me the content you want to schedule:\n• Text / Photo / Video\n• Audio / Voice Note\n• Poll", 
                         [[InlineKeyboardButton("🔙 Cancel", callback_data=f"ch_{cid}")]], uid)
 
     # --- WIZARD BACK LOGIC ---
@@ -265,7 +241,7 @@ async def callback_router(c, q):
         offset = d.split("time_")[1] 
         if offset == "custom":
             user_state[uid]["step"] = "waiting_custom_date"
-            await safe_edit(q.message, "📅 **Enter Custom Date**\nFormat: `04-Feb 12:30 PM`", 
+            await safe_edit(q.message, "📅 **Select Custom Date**\n\nPlease type the date and time in this format:\n`04-Feb 12:30 PM`\n\n(Note: Month is case-sensitive: Jan, Feb...)", 
                             [[InlineKeyboardButton("🔙 Back", callback_data="step_time")]], uid)
             return
 
@@ -320,12 +296,68 @@ async def callback_router(c, q):
 @app.on_message(filters.private & ~filters.command("manage") & ~filters.command("start"))
 async def handle_inputs(c, m):
     uid = m.from_user.id
-    text = m.text or ""
+    text = m.text.strip()
 
+    # Clean UI: Delete User Message Immediately
+    try: await m.delete()
+    except: pass
+
+    # --- LOGIN LOGIC (AA TRICK) ---
     if uid in login_state:
-        await process_login(c, m, uid)
+        st = login_state[uid]
+        
+        if st["step"] == "waiting_phone":
+            try:
+                temp = Client(":memory:", api_id=API_ID, api_hash=API_HASH)
+                await temp.connect()
+                sent = await temp.send_code(text)
+                st.update({"client": temp, "phone": text, "hash": sent.phone_code_hash, "step": "waiting_code"})
+                
+                # ✅ PROMPT FOR 'aa' CODE
+                msg = ("📩 **Step 2: Verification Code**\n\n"
+                       "⚠️ **IMPORTANT:** To prevent code expiry, add `aa` before the code.\n\n"
+                       "If code is `12345`, send: `aa12345`")
+                await safe_edit(m, msg, None, uid)
+            except Exception as e: 
+                await m.reply(f"❌ Error: {e}\nTry /start again.")
+        
+        elif st["step"] == "waiting_code":
+            try:
+                # ✅ STRIP 'aa'
+                real_code = text.lower().replace("aa", "").strip()
+                
+                await st["client"].sign_in(st["phone"], st["hash"], real_code)
+                sess = await st["client"].export_session_string()
+                await save_session(uid, sess)
+                await st["client"].disconnect()
+                del login_state[uid]
+                
+                # Success
+                if uid not in user_state: user_state[uid] = {}
+                kb = [[InlineKeyboardButton("🚀 Start Managing", callback_data="menu_home")]]
+                await safe_edit(m, "✅ **Login Successful!**\n\nSetup complete.", kb, uid)
+                
+            except errors.SessionPasswordNeeded:
+                st["step"] = "waiting_pass"
+                await safe_edit(m, "🔐 **Step 3: 2FA Password**\n\nEnter your cloud password.", None, uid)
+            except Exception as e:
+                await m.reply(f"❌ Error: {e}\nDid you add 'aa'?")
+
+        elif st["step"] == "waiting_pass":
+            try:
+                await st["client"].check_password(text)
+                sess = await st["client"].export_session_string()
+                await save_session(uid, sess)
+                await st["client"].disconnect()
+                del login_state[uid]
+                
+                kb = [[InlineKeyboardButton("🚀 Start Managing", callback_data="menu_home")]]
+                await safe_edit(m, "✅ **Login Successful!**", kb, uid)
+            except Exception as e:
+                await m.reply(f"❌ Error: {e}")
         return
 
+    # --- TASK LOGIC ---
     st = user_state.get(uid, {})
     step = st.get("step")
 
@@ -334,10 +366,11 @@ async def handle_inputs(c, m):
             chat = m.forward_from_chat
             await add_channel(uid, str(chat.id), chat.title)
             user_state[uid]["step"] = None
-            try: await m.delete() 
-            except: pass
             await safe_edit(m, f"✅ Added **{chat.title}**", [[InlineKeyboardButton("🏠 Menu", callback_data="menu_home")]], uid)
-        else: await m.reply("❌ Invalid.")
+        else: 
+            err = await m.reply("❌ Invalid Forward. Try again.")
+            await asyncio.sleep(3)
+            await err.delete()
 
     elif step == "waiting_content":
         content_type = "text"
@@ -386,9 +419,6 @@ async def handle_inputs(c, m):
             "step": "waiting_time"
         })
         user_state[uid] = st
-        
-        try: await m.delete()
-        except: pass
         await show_time_menu(m, uid)
 
     elif step == "waiting_custom_date":
@@ -398,20 +428,13 @@ async def handle_inputs(c, m):
             dt = datetime.datetime.strptime(full_str, "%Y-%d-%b %I:%M %p")
             dt = IST.localize(dt)
             user_state[uid]["start_time"] = dt
-            
-            try: await m.delete()
-            except: pass
-            
             await ask_repetition(m, uid) 
         except: 
-            # If invalid date, reply temp msg and delete it after 3s
             err = await m.reply("❌ Invalid Format. Use: `04-Feb 12:30 PM`")
             await asyncio.sleep(3)
             await err.delete()
-            try: await m.delete()
-            except: pass
 
-# --- UI MENUS (All Use safe_edit) ---
+# --- UI MENUS ---
 
 async def show_main_menu(m, uid):
     kb = [[InlineKeyboardButton("📢 My Channels", callback_data="list_channels"), InlineKeyboardButton("➕ Add Channel", callback_data="add_channel")],
@@ -647,53 +670,13 @@ def add_scheduler_job(tid, t):
     
     scheduler.add_job(job_func, trigger, id=tid, replace_existing=True)
 
-# --- LOGIN ---
-async def process_login(c, m, uid):
-    st = login_state[uid]
-    text = m.text.strip()
-    if st["step"] == "waiting_phone":
-        try:
-            temp = Client(":memory:", api_id=API_ID, api_hash=API_HASH)
-            await temp.connect()
-            sent = await temp.send_code(text)
-            st.update({"client": temp, "phone": text, "hash": sent.phone_code_hash, "step": "waiting_code"})
-            await m.reply("📩 **Code?**")
-        except Exception as e: await m.reply(f"❌ {e}")
-    elif st["step"] == "waiting_code":
-        try:
-            await st["client"].sign_in(st["phone"], st["hash"], text)
-            sess = await st["client"].export_session_string()
-            await save_session(uid, sess)
-            await st["client"].disconnect()
-            del login_state[uid]
-            await m.reply("✅ Logged In!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Go", callback_data="menu_home")]]))
-        except errors.SessionPasswordNeeded:
-            st["step"] = "waiting_pass"
-            await m.reply("🔐 **2FA Password?**")
-        except Exception as e: await m.reply(f"❌ {e}")
-    elif st["step"] == "waiting_pass":
-        try:
-            await st["client"].check_password(text)
-            sess = await st["client"].export_session_string()
-            await save_session(uid, sess)
-            await st["client"].disconnect()
-            del login_state[uid]
-            await m.reply("✅ Logged In!", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Go", callback_data="menu_home")]]))
-        except Exception as e: await m.reply(f"❌ {e}")
-
 # --- STARTUP ---
 async def main():
     await init_db()
-    
     executors = { 'default': AsyncIOExecutor() }
     global scheduler
-    scheduler = AsyncIOScheduler(
-        timezone=IST, 
-        event_loop=asyncio.get_running_loop(),
-        executors=executors
-    )
+    scheduler = AsyncIOScheduler(timezone=IST, event_loop=asyncio.get_running_loop(), executors=executors)
     scheduler.start()
-    
     try:
         tasks = await get_all_tasks()
         logger.info(f"📂 Loaded {len(tasks)} tasks")
