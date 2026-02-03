@@ -602,7 +602,7 @@ async def create_task_logic(uid, q):
         "last_msg_id": None
     }
     
-try:
+    try:
         await save_task(task_data)
         add_scheduler_job(tid, task_data)
         
