@@ -396,7 +396,7 @@ async def handle_inputs(c, m):
             chat = m.forward_from_chat
             await add_channel(uid, str(chat.id), chat.title)
             user_state[uid]["step"] = None
-            await update_menu(m, f"✅ Added **{chat.title}**", [[InlineKeyboardButton("🏠 Menu", callback_data="menu_home")]], uid)
+            await update_menu(m, f"✅ Added **{chat.title}**", [[InlineKeyboardButton("🏠 Menu", callback_data="menu_home")]], uid, force_new=True)
         else: 
             await m.reply("❌ Invalid Forward. Try again.")
 
