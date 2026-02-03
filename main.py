@@ -24,7 +24,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ManagerBot")
 
 # --- INIT ---
-app = Client("manager_v31_stable", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("manager_v32_master", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 scheduler = None 
 db_pool = None
 queue_lock = None # Initialized in main
@@ -218,7 +218,7 @@ async def callback_router(c, q):
         await del_session(uid)
         await update_menu(q.message, "👋 **Logged out.**\n\nUse /start to login again.", None, uid)
 
-    # --- TASK ACTIONS ---
+    # --- TASK ACTIONS (PRO UI) ---
     elif d.startswith("view_"):
         tid = d.split("view_")[1]
         await show_task_details(uid, q.message, tid)
@@ -640,6 +640,7 @@ async def create_task_logic(uid, q):
                      f"🔁 **Repeat:** `{st['interval'] or 'No'}`\n\n"
                      f"👉 Click /manage to schedule more.")
         
+        # ✅ FINAL: Edit the Summary message (force_new=False)
         await update_menu(q.message, final_txt, None, uid, force_new=False)
     except Exception as e:
         logger.error(f"Save Error: {e}")
@@ -700,27 +701,22 @@ def add_scheduler_job(tid, t):
                                 sent = await user.send_photo(target, t["file_id"], caption=caption, caption_entities=entities_objs)
                             elif t["content_type"] == "video":
                                 sent = await user.send_video(target, t["file_id"], caption=caption, caption_entities=entities_objs)
+                            # ✅ CORRECTED: Wraps bytes in BytesIO for Audio/Voice
                             elif t["content_type"] in ["audio", "voice"]:
                                 try:
-                                    # ✅ CORRECTED: app.download_media returns BytesIO directly when in_memory=True
-                                    logger.info(f"📥 Downloading {t['content_type']} {t['file_id']}...")
-                                    media_file = await app.download_media(t["file_id"], in_memory=True)
+                                    logger.info(f"📥 Downloading {t['content_type']}...")
+                                    file_bytes = await app.download_media(t["file_id"], in_memory=True)
+                                    media_file = BytesIO(file_bytes) # Wrap in BytesIO
                                     
-                                    if not media_file:
-                                        logger.error(f"❌ Download failed for {t['file_id']}")
-                                        return
-                                    
-                                    # ✅ BytesIO is ready - set name for proper detection
                                     if t["content_type"] == "voice":
                                         media_file.name = "voice.ogg"
                                         sent = await user.send_voice(target, media_file, caption=caption)
-                                    else:  # audio
-                                        media_file.name = "audio.m4a"  # or "audio.mp3"
-                                        sent = await user.send_audio(target, media_file, caption=caption, caption_entities=entities_objs)
-                                        
+                                    else:
+                                        media_file.name = "audio.mp3"
+                                        sent = await user.send_audio(target, media_file, file_name="audio.mp3", caption=caption, caption_entities=entities_objs)
                                 except Exception as e:
-                                    logger.error(f"❌ Audio/Voice Error: {e}")
-                                    
+                                    logger.error(f"❌ Audio/Voice Upload Error: {e}")
+
                             elif t["content_type"] == "document":
                                 sent = await user.send_document(target, t["file_id"], caption=caption, caption_entities=entities_objs)
                             elif t["content_type"] == "sticker":
