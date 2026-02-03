@@ -23,7 +23,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ManagerBot")
 
 # --- INIT ---
-app = Client("manager_v25_stable", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("manager_v26_hybrid", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 scheduler = None 
 db_pool = None
 queue_lock = asyncio.Lock()
@@ -44,8 +44,8 @@ async def init_db():
     async with pool.acquire() as conn:
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_sessions (user_id BIGINT PRIMARY KEY, session_string TEXT)''')
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_channels (user_id BIGINT, channel_id TEXT, title TEXT, PRIMARY KEY(user_id, channel_id))''')
-        # Keeping V9 since you didn't want to wipe
-        await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_tasks_v9
+        # Using V10 for clean separation
+        await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_tasks_v10
                           (task_id TEXT PRIMARY KEY, owner_id BIGINT, chat_id TEXT, 
                            content_type TEXT, content_text TEXT, file_id TEXT, 
                            entities TEXT, 
@@ -76,47 +76,47 @@ async def get_channels(user_id):
 
 async def del_channel(user_id, cid):
     pool = await get_db()
-    tasks = await pool.fetch("SELECT task_id FROM userbot_tasks_v9 WHERE chat_id = $1", cid)
+    tasks = await pool.fetch("SELECT task_id FROM userbot_tasks_v10 WHERE chat_id = $1", cid)
     if scheduler:
         for t in tasks:
             try: scheduler.remove_job(t['task_id'])
             except: pass
-    await pool.execute("DELETE FROM userbot_tasks_v9 WHERE chat_id = $1", cid)
+    await pool.execute("DELETE FROM userbot_tasks_v10 WHERE chat_id = $1", cid)
     await pool.execute("DELETE FROM userbot_channels WHERE user_id = $1 AND channel_id = $2", user_id, cid)
 
 async def save_task(t):
     pool = await get_db()
     await pool.execute("""
-        INSERT INTO userbot_tasks_v9 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        INSERT INTO userbot_tasks_v10 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
         ON CONFLICT (task_id) DO UPDATE SET last_msg_id = $12, start_time = $11
     """, t['task_id'], t['owner_id'], t['chat_id'], t['content_type'], t['content_text'], t['file_id'], 
        t['entities'], t['pin'], t['delete_old'], t['repeat_interval'], t['start_time'], t['last_msg_id'])
 
 async def get_all_tasks():
     pool = await get_db()
-    return [dict(x) for x in await pool.fetch("SELECT * FROM userbot_tasks_v9")]
+    return [dict(x) for x in await pool.fetch("SELECT * FROM userbot_tasks_v10")]
 
 async def get_user_tasks(user_id, chat_id):
     pool = await get_db()
-    return [dict(x) for x in await pool.fetch("SELECT * FROM userbot_tasks_v9 WHERE owner_id = $1 AND chat_id = $2", user_id, chat_id)]
+    return [dict(x) for x in await pool.fetch("SELECT * FROM userbot_tasks_v10 WHERE owner_id = $1 AND chat_id = $2", user_id, chat_id)]
 
 async def delete_task(task_id):
     pool = await get_db()
-    row = await pool.fetchrow("SELECT chat_id FROM userbot_tasks_v9 WHERE task_id = $1", task_id)
-    await pool.execute("DELETE FROM userbot_tasks_v9 WHERE task_id = $1", task_id)
+    row = await pool.fetchrow("SELECT chat_id FROM userbot_tasks_v10 WHERE task_id = $1", task_id)
+    await pool.execute("DELETE FROM userbot_tasks_v10 WHERE task_id = $1", task_id)
     return row['chat_id'] if row else None
 
 async def update_last_msg(task_id, msg_id):
     pool = await get_db()
-    await pool.execute("UPDATE userbot_tasks_v9 SET last_msg_id = $1 WHERE task_id = $2", msg_id, task_id)
+    await pool.execute("UPDATE userbot_tasks_v10 SET last_msg_id = $1 WHERE task_id = $2", msg_id, task_id)
 
 async def get_task_last_msg_id(task_id):
     pool = await get_db()
-    return await pool.fetchval("SELECT last_msg_id FROM userbot_tasks_v9 WHERE task_id = $1", task_id)
+    return await pool.fetchval("SELECT last_msg_id FROM userbot_tasks_v10 WHERE task_id = $1", task_id)
 
 async def update_next_run(task_id, next_time_str):
     pool = await get_db()
-    await pool.execute("UPDATE userbot_tasks_v9 SET start_time = $1 WHERE task_id = $2", next_time_str, task_id)
+    await pool.execute("UPDATE userbot_tasks_v10 SET start_time = $1 WHERE task_id = $2", next_time_str, task_id)
 
 # --- SERIALIZATION ---
 def serialize_entities(entities_list):
@@ -145,24 +145,20 @@ def deserialize_entities(json_str):
         return entities
     except: return None
 
-# --- UI HELPER: SINGLE MSG ---
-async def safe_edit(m, text, kb, uid):
-    """Edits the active menu message. If deleted, sends a new one."""
+# --- UI HELPER (EDIT ONLY) ---
+async def edit_current_menu(m, text, kb, uid):
+    """
+    Used ONLY for Button Clicks.
+    Always Edits the message that triggered the callback.
+    """
     markup = InlineKeyboardMarkup(kb) if kb else None
-    
-    st = user_state.get(uid, {})
-    menu_id = st.get("menu_msg_id")
-    chat_id = m.chat.id
-
-    if menu_id:
-        try:
-            await app.edit_message_text(chat_id, menu_id, text, reply_markup=markup)
-            return
-        except: pass 
-
-    sent = await app.send_message(chat_id, text, reply_markup=markup)
-    if uid in user_state:
-        user_state[uid]["menu_msg_id"] = sent.id
+    try:
+        await m.edit_text(text, reply_markup=markup)
+        # Update our tracking ID just in case
+        if uid in user_state:
+            user_state[uid]["menu_msg_id"] = m.id
+    except Exception as e:
+        logger.error(f"Edit Failed: {e}")
 
 # --- BOT INTERFACE ---
 
@@ -174,11 +170,11 @@ async def start_cmd(c, m):
     if await get_session(uid):
         kb = [[InlineKeyboardButton("📢 My Channels", callback_data="list_channels"), InlineKeyboardButton("➕ Add Channel", callback_data="add_channel")],
               [InlineKeyboardButton("🚪 Logout", callback_data="logout")]]
-        sent = await m.reply("👋 **Manager Dashboard**\n\nWelcome back, Admin.", reply_markup=InlineKeyboardMarkup(kb))
+        sent = await m.reply("👋 **Manager Dashboard**\n\nWelcome back.", reply_markup=InlineKeyboardMarkup(kb))
         user_state[uid]["menu_msg_id"] = sent.id
     else:
         await m.reply_text(
-            "👋 **Welcome to Manager Bot**\n\nI can schedule posts, polls, and media.\n\n👇 **Click Login to begin setup.**",
+            "👋 **Welcome to Manager Bot**\n\nI can schedule posts, polls, and media.\n\n👇 **Click Login to begin.**",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Login Account", callback_data="login_start")]])
         )
 
@@ -188,61 +184,62 @@ async def callback_router(c, q):
     d = q.data
 
     if uid not in user_state: user_state[uid] = {}
-    user_state[uid]["menu_msg_id"] = q.message.id
-
+    
+    # 📌 HYBRID FLOW: Callbacks ALWAYS Edit
+    
     if d == "menu_home":
         user_state[uid]["step"] = None
-        await show_main_menu(q.message, uid)
+        await show_main_menu(q.message, uid, edit=True)
     
-    # --- PRO LOGIN FLOW ---
+    # --- LOGIN ---
     elif d == "login_start":
         login_state[uid] = {"step": "waiting_phone"}
-        await safe_edit(q.message, "📱 **Step 1: Phone Number**\n\nPlease enter your Telegram phone number with country code.\n\nExample: `+919876543210`", [[InlineKeyboardButton("🔙 Cancel", callback_data="menu_home")]], uid)
+        await edit_current_menu(q.message, "📱 **Step 1: Phone Number**\n\nPlease enter your number.\nExample: `+919876543210`", [[InlineKeyboardButton("🔙 Cancel", callback_data="menu_home")]], uid)
     
     elif d == "logout":
         await del_session(uid)
-        await safe_edit(q.message, "👋 **Logged out.**\n\nUse /start to login again.", None, uid)
+        await edit_current_menu(q.message, "👋 **Logged out.**\n\nUse /start to login.", None, uid)
 
-    # --- CHANNEL MANAGEMENT ---
+    # --- CHANNELS ---
     elif d == "list_channels":
-        await show_channels(uid, q.message)
+        await show_channels(uid, q.message, edit=True)
     
     elif d == "add_channel":
         user_state[uid]["step"] = "waiting_forward"
-        await safe_edit(q.message, "📝 **Step 2: Add Channel**\n\nForward a message from your channel to this chat now.\nI will detect the ID automatically.", 
-                        [[InlineKeyboardButton("🔙 Cancel", callback_data="menu_home")]], uid)
+        await edit_current_menu(q.message, "📝 **Step 2: Add Channel**\n\nForward a message from your channel to this chat now.", 
+                                [[InlineKeyboardButton("🔙 Cancel", callback_data="menu_home")]], uid)
     
     elif d.startswith("ch_"):
         cid = d.split("ch_")[1]
-        await show_channel_options(uid, q.message, cid)
+        await show_channel_options(uid, q.message, cid, edit=True)
     
     elif d.startswith("rem_"):
         cid = d.split("rem_")[1]
         await del_channel(uid, cid)
-        await q.answer("Channel Unlinked!")
-        await show_channels(uid, q.message)
+        await q.answer("Channel Unlinked & Tasks Deleted!")
+        await show_channels(uid, q.message, edit=True)
 
     elif d.startswith("new_"):
         cid = d.split("new_")[1]
         user_state[uid].update({"step": "waiting_content", "target": cid})
-        await safe_edit(q.message, "1️⃣ **Create Post**\n\nSend me the content you want to schedule:\n• Text / Photo / Video\n• Audio / Voice Note\n• Poll", 
-                        [[InlineKeyboardButton("🔙 Cancel", callback_data=f"ch_{cid}")]], uid)
+        await edit_current_menu(q.message, "1️⃣ **Create Post**\n\nSend content now:\n• Text / Photo / Video\n• Audio / Voice / Poll", 
+                                [[InlineKeyboardButton("🔙 Cancel", callback_data=f"ch_{cid}")]], uid)
 
     # --- WIZARD BACK LOGIC ---
     elif d == "step_time":
-        await show_time_menu(q.message, uid)
+        await show_time_menu(q.message, uid, edit=True)
     elif d == "step_rep":
-        await ask_repetition(q.message, uid)
+        await ask_repetition(q.message, uid, edit=True)
     elif d == "step_settings":
-        await ask_settings(q.message, uid)
+        await ask_settings(q.message, uid, edit=True)
 
     # --- TIME ---
     elif d.startswith("time_"):
         offset = d.split("time_")[1] 
         if offset == "custom":
             user_state[uid]["step"] = "waiting_custom_date"
-            await safe_edit(q.message, "📅 **Select Custom Date**\n\nPlease type the date and time in this format:\n`04-Feb 12:30 PM`\n\n(Note: Month is case-sensitive: Jan, Feb...)", 
-                            [[InlineKeyboardButton("🔙 Back", callback_data="step_time")]], uid)
+            await edit_current_menu(q.message, "📅 **Select Custom Date**\n\nType date format:\n`04-Feb 12:30 PM`", 
+                                    [[InlineKeyboardButton("🔙 Back", callback_data="step_time")]], uid)
             return
 
         now = datetime.datetime.now(IST)
@@ -253,7 +250,7 @@ async def callback_router(c, q):
             run_time = run_time.replace(second=0, microsecond=0)
         
         user_state[uid]["start_time"] = run_time
-        await ask_repetition(q.message, uid)
+        await ask_repetition(q.message, uid, edit=True)
 
     # --- REPEAT ---
     elif d.startswith("rep_"):
@@ -261,7 +258,7 @@ async def callback_router(c, q):
         interval = None
         if val != "0": interval = f"minutes={val}"
         user_state[uid]["interval"] = interval
-        await ask_settings(q.message, uid)
+        await ask_settings(q.message, uid, edit=True)
 
     # --- SETTINGS ---
     elif d in ["toggle_pin", "toggle_del"]:
@@ -270,17 +267,17 @@ async def callback_router(c, q):
         st.setdefault("del", True)
         if d == "toggle_pin": st["pin"] = not st["pin"]
         if d == "toggle_del": st["del"] = not st["del"]
-        await ask_settings(q.message, uid)
+        await ask_settings(q.message, uid, edit=True)
 
     elif d == "goto_confirm":
-        await confirm_task(q.message, uid)
+        await confirm_task(q.message, uid, edit=True)
 
     elif d == "save_task":
         await create_task_logic(uid, q)
 
     elif d.startswith("tasks_"):
         cid = d.split("tasks_")[1]
-        await list_active_tasks(uid, q.message, cid)
+        await list_active_tasks(uid, q.message, cid, edit=True)
     
     elif d.startswith("del_task_"):
         tid = d.split("del_task_")[1]
@@ -288,36 +285,31 @@ async def callback_router(c, q):
         except: pass
         chat_id = await delete_task(tid)
         await q.answer("🗑 Task Deleted!")
-        if chat_id: await list_active_tasks(uid, q.message, chat_id)
-        else: await show_main_menu(q.message, uid)
+        if chat_id: await list_active_tasks(uid, q.message, chat_id, edit=True)
+        else: await show_main_menu(q.message, uid, edit=True)
 
-# --- INPUTS ---
+# --- INPUTS (HYBRID FLOW: SENDS NEW MSG) ---
 
 @app.on_message(filters.private & ~filters.command("manage") & ~filters.command("start"))
 async def handle_inputs(c, m):
     uid = m.from_user.id
-    
-    # ✅ FIX: Safe Text Extraction (Prevents Poll/Audio Crash)
+    # Safe text access
     text = m.text.strip() if m.text else ""
 
-    # ✅ NO DELETION (As requested)
-    # try: await m.delete()
-    # except: pass
-
-    # --- LOGIN LOGIC (AA TRICK) ---
+    # --- LOGIN ---
     if uid in login_state:
         st = login_state[uid]
-        
         if st["step"] == "waiting_phone":
             try:
                 temp = Client(":memory:", api_id=API_ID, api_hash=API_HASH)
                 await temp.connect()
                 sent = await temp.send_code(text)
                 st.update({"client": temp, "phone": text, "hash": sent.phone_code_hash, "step": "waiting_code"})
-                
-                await safe_edit(m, "📩 **Step 2: Verification Code**\n\n⚠️ **IMPORTANT:** To prevent code expiry, add `aa` before the code.\n\nIf code is `12345`, send: `aa12345`", None, uid)
-            except Exception as e: 
-                await m.reply(f"❌ Error: {e}\nTry /start again.")
+                # Reply new
+                sent_msg = await m.reply("📩 **Step 2: Enter Code**\n\n⚠️ Add `aa` before code (e.g. `aa12345`).")
+                if uid not in user_state: user_state[uid] = {}
+                user_state[uid]["menu_msg_id"] = sent_msg.id
+            except Exception as e: await m.reply(f"❌ Error: {e}")
         
         elif st["step"] == "waiting_code":
             try:
@@ -328,15 +320,14 @@ async def handle_inputs(c, m):
                 await st["client"].disconnect()
                 del login_state[uid]
                 
-                if uid not in user_state: user_state[uid] = {}
                 kb = [[InlineKeyboardButton("🚀 Start Managing", callback_data="menu_home")]]
-                await safe_edit(m, "✅ **Login Successful!**\n\nSetup complete.", kb, uid)
-                
+                sent_msg = await m.reply("✅ **Login Successful!**", reply_markup=InlineKeyboardMarkup(kb))
+                if uid not in user_state: user_state[uid] = {}
+                user_state[uid]["menu_msg_id"] = sent_msg.id
             except errors.SessionPasswordNeeded:
                 st["step"] = "waiting_pass"
-                await safe_edit(m, "🔐 **Step 3: 2FA Password**\n\nEnter your cloud password.", None, uid)
-            except Exception as e:
-                await m.reply(f"❌ Error: {e}\nDid you add 'aa'?")
+                await m.reply("🔐 **Step 3: 2FA Password Required**")
+            except Exception as e: await m.reply(f"❌ Error: {e}")
 
         elif st["step"] == "waiting_pass":
             try:
@@ -346,9 +337,10 @@ async def handle_inputs(c, m):
                 await st["client"].disconnect()
                 del login_state[uid]
                 kb = [[InlineKeyboardButton("🚀 Start Managing", callback_data="menu_home")]]
-                await safe_edit(m, "✅ **Login Successful!**", kb, uid)
-            except Exception as e:
-                await m.reply(f"❌ Error: {e}")
+                sent_msg = await m.reply("✅ **Login Successful!**", reply_markup=InlineKeyboardMarkup(kb))
+                if uid not in user_state: user_state[uid] = {}
+                user_state[uid]["menu_msg_id"] = sent_msg.id
+            except Exception as e: await m.reply(f"❌ Error: {e}")
         return
 
     # --- TASK LOGIC ---
@@ -360,9 +352,9 @@ async def handle_inputs(c, m):
             chat = m.forward_from_chat
             await add_channel(uid, str(chat.id), chat.title)
             user_state[uid]["step"] = None
-            await safe_edit(m, f"✅ Added **{chat.title}**", [[InlineKeyboardButton("🏠 Menu", callback_data="menu_home")]], uid)
-        else: 
-            await m.reply("❌ Invalid Forward. Try again.")
+            sent_msg = await m.reply(f"✅ Added **{chat.title}**", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu", callback_data="menu_home")]]))
+            user_state[uid]["menu_msg_id"] = sent_msg.id
+        else: await m.reply("❌ Invalid Forward.")
 
     elif step == "waiting_content":
         content_type = "text"
@@ -370,7 +362,6 @@ async def handle_inputs(c, m):
         content_text = m.text or m.caption or ""
         entities_json = None
         
-        # ✅ FIX: Handle Polls properly
         if m.poll:
             content_type = "poll"
             content_text = m.poll.question
@@ -412,7 +403,9 @@ async def handle_inputs(c, m):
             "step": "waiting_time"
         })
         user_state[uid] = st
-        await show_time_menu(m, uid)
+        
+        # 📌 HYBRID: Send NEW message, then track it
+        await show_time_menu(m, uid, edit=False)
 
     elif step == "waiting_custom_date":
         try:
@@ -421,37 +414,42 @@ async def handle_inputs(c, m):
             dt = datetime.datetime.strptime(full_str, "%Y-%d-%b %I:%M %p")
             dt = IST.localize(dt)
             user_state[uid]["start_time"] = dt
-            await ask_repetition(m, uid) 
+            
+            # 📌 HYBRID: Send NEW message, then track it
+            await ask_repetition(m, uid, edit=False) 
         except: 
             await m.reply("❌ Invalid Format. Use: `04-Feb 12:30 PM`")
 
-# --- UI MENUS ---
+# --- MENUS (Hybrid Support) ---
 
-async def show_main_menu(m, uid):
+async def show_main_menu(m, uid, edit=True):
     kb = [[InlineKeyboardButton("📢 My Channels", callback_data="list_channels"), InlineKeyboardButton("➕ Add Channel", callback_data="add_channel")],
           [InlineKeyboardButton("🚪 Logout", callback_data="logout")]]
-    await safe_edit(m, "👋 **Manager Dashboard**", kb, uid)
+    if edit: await edit_current_menu(m, "👋 **Manager Dashboard**", kb, uid)
+    else: 
+        sent = await m.reply("👋 **Manager Dashboard**", reply_markup=InlineKeyboardMarkup(kb))
+        user_state[uid]["menu_msg_id"] = sent.id
 
-async def show_channels(uid, m):
+async def show_channels(uid, m, edit=True):
     chs = await get_channels(uid)
     if not chs:
-        await safe_edit(m, "❌ No channels.", [[InlineKeyboardButton("➕ Add One", callback_data="add_channel")]], uid)
+        await edit_current_menu(m, "❌ No channels.", [[InlineKeyboardButton("➕ Add One", callback_data="add_channel")]], uid)
         return
     kb = []
     for c in chs: kb.append([InlineKeyboardButton(c['title'], callback_data=f"ch_{c['channel_id']}")])
     kb.append([InlineKeyboardButton("🔙 Back", callback_data="menu_home")])
-    await safe_edit(m, "👇 **Select a Channel:**", kb, uid)
+    await edit_current_menu(m, "👇 **Select a Channel:**", kb, uid)
 
-async def show_channel_options(uid, m, cid):
+async def show_channel_options(uid, m, cid, edit=True):
     tasks = await get_user_tasks(uid, cid)
     kb = [
         [InlineKeyboardButton("✍️ Schedule Post", callback_data=f"new_{cid}")],
         [InlineKeyboardButton(f"📅 Scheduled ({len(tasks)})", callback_data=f"tasks_{cid}")],
         [InlineKeyboardButton("🗑 Unlink", callback_data=f"rem_{cid}"), InlineKeyboardButton("🔙 Back", callback_data="list_channels")]
     ]
-    await safe_edit(m, f"⚙️ **Managing Channel**", kb, uid)
+    await edit_current_menu(m, f"⚙️ **Managing Channel**", kb, uid)
 
-async def show_time_menu(m, uid):
+async def show_time_menu(m, uid, edit=True):
     cid = user_state[uid].get("target")
     kb = [
         [InlineKeyboardButton("🚀 Post Now", callback_data="time_0")],
@@ -459,9 +457,12 @@ async def show_time_menu(m, uid):
         [InlineKeyboardButton("📅 Custom Date", callback_data="time_custom")],
         [InlineKeyboardButton("🔙 Back", callback_data=f"ch_{cid}")] 
     ]
-    await safe_edit(m, "2️⃣ **When to post?**", kb, uid)
+    if edit: await edit_current_menu(m, "2️⃣ **When to post?**", kb, uid)
+    else:
+        sent = await m.reply("2️⃣ **When to post?**", reply_markup=InlineKeyboardMarkup(kb))
+        user_state[uid]["menu_msg_id"] = sent.id
 
-async def ask_repetition(m, uid):
+async def ask_repetition(m, uid, edit=True):
     kb = [
         [InlineKeyboardButton("🚫 No Repeat", callback_data="rep_0")],
         [InlineKeyboardButton("🔁 5 Mins", callback_data="rep_5"), InlineKeyboardButton("🔁 30 Mins", callback_data="rep_30")],
@@ -471,9 +472,14 @@ async def ask_repetition(m, uid):
     ]
     st = user_state[uid]
     time_str = st["start_time"].strftime("%d-%b %I:%M %p")
-    await safe_edit(m, f"3️⃣ **Repeat?**\nSelected Time: `{time_str}`", kb, uid)
+    txt = f"3️⃣ **Repeat?**\nSelected Time: `{time_str}`"
+    
+    if edit: await edit_current_menu(m, txt, kb, uid)
+    else:
+        sent = await m.reply(txt, reply_markup=InlineKeyboardMarkup(kb))
+        user_state[uid]["menu_msg_id"] = sent.id
 
-async def ask_settings(m, uid):
+async def ask_settings(m, uid, edit=True):
     st = user_state[uid]
     st.setdefault("pin", True)
     st.setdefault("del", True)
@@ -487,9 +493,9 @@ async def ask_settings(m, uid):
         [InlineKeyboardButton("➡️ Confirm", callback_data="goto_confirm")],
         [InlineKeyboardButton("🔙 Back", callback_data="step_rep")]
     ]
-    await safe_edit(m, "4️⃣ **Settings**", kb, uid)
+    await edit_current_menu(m, "4️⃣ **Settings**", kb, uid)
 
-async def confirm_task(m, uid):
+async def confirm_task(m, uid, edit=True):
     st = user_state[uid]
     t_str = st["start_time"].strftime("%d-%b %I:%M %p")
     r_str = st["interval"] if st["interval"] else "Once"
@@ -503,12 +509,12 @@ async def confirm_task(m, uid):
     kb = [[InlineKeyboardButton("✅ Schedule It", callback_data="save_task")],
           [InlineKeyboardButton("🔙 Back", callback_data="step_settings")]]
     
-    await safe_edit(m, txt, kb, uid)
+    await edit_current_menu(m, txt, kb, uid)
 
-async def list_active_tasks(uid, m, cid):
+async def list_active_tasks(uid, m, cid, edit=True):
     tasks = await get_user_tasks(uid, cid)
     if not tasks:
-        await safe_edit(m, "✅ No active tasks.", [[InlineKeyboardButton("🔙 Back", callback_data=f"ch_{cid}")]], uid)
+        await edit_current_menu(m, "✅ No active tasks.", [[InlineKeyboardButton("🔙 Back", callback_data=f"ch_{cid}")]], uid)
         return
     txt = "**Active Tasks:**\n"
     kb = []
@@ -520,7 +526,7 @@ async def list_active_tasks(uid, m, cid):
         txt += f"• `{time_str}` ({t['repeat_interval'] or 'Once'})\n"
         kb.append([InlineKeyboardButton(f"🗑 Delete {time_str}", callback_data=f"del_task_{t['task_id']}")])
     kb.append([InlineKeyboardButton("🔙 Back", callback_data=f"ch_{cid}")])
-    await safe_edit(m, txt, kb, uid)
+    await edit_current_menu(m, txt, kb, uid)
 
 # --- WORKER ---
 async def create_task_logic(uid, q):
@@ -562,7 +568,7 @@ async def create_task_logic(uid, q):
                      f"📌 **Pin:** {'Yes' if st['pin'] else 'No'}\n"
                      f"🗑 **Auto-Delete Old:** {'Yes' if st['del'] else 'No'}")
         
-        await safe_edit(q.message, final_txt, [[InlineKeyboardButton("🏠 Home", callback_data="menu_home")]], uid)
+        await edit_current_menu(q.message, final_txt, [[InlineKeyboardButton("🏠 Home", callback_data="menu_home")]], uid)
     except Exception as e:
         logger.error(f"Save Error: {e}")
         await q.message.edit_text(f"❌ Error: {e}")
