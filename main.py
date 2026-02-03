@@ -24,7 +24,7 @@ logger = logging.getLogger("ManagerBot")
 
 # --- INIT ---
 app = Client("manager_v27_final", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-scheduler = None 
+scheduler = None
 db_pool = None
 queue_lock = None # Initialized in main
 
@@ -416,7 +416,7 @@ async def handle_inputs(c, m):
             raw_entities = m.entities or m.caption_entities
             entities_json = serialize_entities(raw_entities)
 
-            # ✅ ROBUST MEDIA DETECTION (Catches all types)
+            # --- REPLACE MEDIA BLOCK WITH THIS ---
             if m.photo:
                 content_type = "photo"
                 file_id = m.photo.file_id
@@ -435,11 +435,11 @@ async def handle_inputs(c, m):
             elif m.sticker:
                 content_type = "sticker"
                 file_id = m.sticker.file_id
-            elif m.animation: # ✅ ADDED: GIF Support
+            elif m.animation:
                 content_type = "animation"
                 file_id = m.animation.file_id
         
-        # ✅ VALIDATION: Fixes [400 MEDIA_EMPTY]
+        # ✅ CRITICAL FIX: Stops the bot if File ID is missing (Prevents Error)
         if content_type != "text" and content_type != "poll" and not file_id:
             await m.reply("❌ **Error:** Media ID missing. Please try forwarding the file instead.")
             return
