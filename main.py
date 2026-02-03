@@ -700,22 +700,27 @@ def add_scheduler_job(tid, t):
                                 sent = await user.send_photo(target, t["file_id"], caption=caption, caption_entities=entities_objs)
                             elif t["content_type"] == "video":
                                 sent = await user.send_video(target, t["file_id"], caption=caption, caption_entities=entities_objs)
-                            # ✅ FIXED: Correct Logic for Audio/Voice
                             elif t["content_type"] in ["audio", "voice"]:
                                 try:
-                                    logger.info(f"📥 Downloading {t['content_type']}...")
-                                    file_bytes = await app.download_media(t["file_id"], in_memory=True)
-                                    media_file = BytesIO(file_bytes) # Wrap in BytesIO
+                                    # ✅ CORRECTED: app.download_media returns BytesIO directly when in_memory=True
+                                    logger.info(f"📥 Downloading {t['content_type']} {t['file_id']}...")
+                                    media_file = await app.download_media(t["file_id"], in_memory=True)
                                     
+                                    if not media_file:
+                                        logger.error(f"❌ Download failed for {t['file_id']}")
+                                        return
+                                    
+                                    # ✅ BytesIO is ready - set name for proper detection
                                     if t["content_type"] == "voice":
                                         media_file.name = "voice.ogg"
                                         sent = await user.send_voice(target, media_file, caption=caption)
-                                    else:
-                                        media_file.name = "audio.mp3"
+                                    else:  # audio
+                                        media_file.name = "audio.m4a"  # or "audio.mp3"
                                         sent = await user.send_audio(target, media_file, caption=caption, caption_entities=entities_objs)
+                                        
                                 except Exception as e:
-                                    logger.error(f"❌ Audio/Voice Upload Error: {e}")
-
+                                    logger.error(f"❌ Audio/Voice Error: {e}")
+                                    
                             elif t["content_type"] == "document":
                                 sent = await user.send_document(target, t["file_id"], caption=caption, caption_entities=entities_objs)
                             elif t["content_type"] == "sticker":
