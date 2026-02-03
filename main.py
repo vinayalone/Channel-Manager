@@ -23,7 +23,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ManagerBot")
 
 # --- INIT ---
-app = Client("manager_v24_pro", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client("manager_v25_stable", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 scheduler = None 
 db_pool = None
 queue_lock = asyncio.Lock()
@@ -44,6 +44,7 @@ async def init_db():
     async with pool.acquire() as conn:
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_sessions (user_id BIGINT PRIMARY KEY, session_string TEXT)''')
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_channels (user_id BIGINT, channel_id TEXT, title TEXT, PRIMARY KEY(user_id, channel_id))''')
+        # Keeping V9 since you didn't want to wipe
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_tasks_v9
                           (task_id TEXT PRIMARY KEY, owner_id BIGINT, chat_id TEXT, 
                            content_type TEXT, content_text TEXT, file_id TEXT, 
@@ -176,7 +177,6 @@ async def start_cmd(c, m):
         sent = await m.reply("👋 **Manager Dashboard**\n\nWelcome back, Admin.", reply_markup=InlineKeyboardMarkup(kb))
         user_state[uid]["menu_msg_id"] = sent.id
     else:
-        # Professional Login Prompt
         await m.reply_text(
             "👋 **Welcome to Manager Bot**\n\nI can schedule posts, polls, and media.\n\n👇 **Click Login to begin setup.**",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Login Account", callback_data="login_start")]])
@@ -296,11 +296,13 @@ async def callback_router(c, q):
 @app.on_message(filters.private & ~filters.command("manage") & ~filters.command("start"))
 async def handle_inputs(c, m):
     uid = m.from_user.id
-    text = m.text.strip()
+    
+    # ✅ FIX: Safe Text Extraction (Prevents Poll/Audio Crash)
+    text = m.text.strip() if m.text else ""
 
-    # Clean UI: Delete User Message Immediately
-    try: await m.delete()
-    except: pass
+    # ✅ NO DELETION (As requested)
+    # try: await m.delete()
+    # except: pass
 
     # --- LOGIN LOGIC (AA TRICK) ---
     if uid in login_state:
@@ -313,26 +315,19 @@ async def handle_inputs(c, m):
                 sent = await temp.send_code(text)
                 st.update({"client": temp, "phone": text, "hash": sent.phone_code_hash, "step": "waiting_code"})
                 
-                # ✅ PROMPT FOR 'aa' CODE
-                msg = ("📩 **Step 2: Verification Code**\n\n"
-                       "⚠️ **IMPORTANT:** To prevent code expiry, add `aa` before the code.\n\n"
-                       "If code is `12345`, send: `aa12345`")
-                await safe_edit(m, msg, None, uid)
+                await safe_edit(m, "📩 **Step 2: Verification Code**\n\n⚠️ **IMPORTANT:** To prevent code expiry, add `aa` before the code.\n\nIf code is `12345`, send: `aa12345`", None, uid)
             except Exception as e: 
                 await m.reply(f"❌ Error: {e}\nTry /start again.")
         
         elif st["step"] == "waiting_code":
             try:
-                # ✅ STRIP 'aa'
                 real_code = text.lower().replace("aa", "").strip()
-                
                 await st["client"].sign_in(st["phone"], st["hash"], real_code)
                 sess = await st["client"].export_session_string()
                 await save_session(uid, sess)
                 await st["client"].disconnect()
                 del login_state[uid]
                 
-                # Success
                 if uid not in user_state: user_state[uid] = {}
                 kb = [[InlineKeyboardButton("🚀 Start Managing", callback_data="menu_home")]]
                 await safe_edit(m, "✅ **Login Successful!**\n\nSetup complete.", kb, uid)
@@ -350,7 +345,6 @@ async def handle_inputs(c, m):
                 await save_session(uid, sess)
                 await st["client"].disconnect()
                 del login_state[uid]
-                
                 kb = [[InlineKeyboardButton("🚀 Start Managing", callback_data="menu_home")]]
                 await safe_edit(m, "✅ **Login Successful!**", kb, uid)
             except Exception as e:
@@ -368,9 +362,7 @@ async def handle_inputs(c, m):
             user_state[uid]["step"] = None
             await safe_edit(m, f"✅ Added **{chat.title}**", [[InlineKeyboardButton("🏠 Menu", callback_data="menu_home")]], uid)
         else: 
-            err = await m.reply("❌ Invalid Forward. Try again.")
-            await asyncio.sleep(3)
-            await err.delete()
+            await m.reply("❌ Invalid Forward. Try again.")
 
     elif step == "waiting_content":
         content_type = "text"
@@ -378,6 +370,7 @@ async def handle_inputs(c, m):
         content_text = m.text or m.caption or ""
         entities_json = None
         
+        # ✅ FIX: Handle Polls properly
         if m.poll:
             content_type = "poll"
             content_text = m.poll.question
@@ -430,9 +423,7 @@ async def handle_inputs(c, m):
             user_state[uid]["start_time"] = dt
             await ask_repetition(m, uid) 
         except: 
-            err = await m.reply("❌ Invalid Format. Use: `04-Feb 12:30 PM`")
-            await asyncio.sleep(3)
-            await err.delete()
+            await m.reply("❌ Invalid Format. Use: `04-Feb 12:30 PM`")
 
 # --- UI MENUS ---
 
