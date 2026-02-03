@@ -24,8 +24,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ManagerBot")
 
 # --- INIT ---
-app = Client("manager_v27_final", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-scheduler = None
+app = Client("manager_v31_stable", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+scheduler = None 
 db_pool = None
 queue_lock = None # Initialized in main
 
@@ -45,7 +45,6 @@ async def init_db():
     async with pool.acquire() as conn:
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_sessions (user_id BIGINT PRIMARY KEY, session_string TEXT)''')
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_channels (user_id BIGINT, channel_id TEXT, title TEXT, PRIMARY KEY(user_id, channel_id))''')
-        # V11 to ensure fresh start for media tasks
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_tasks_v11
                           (task_id TEXT PRIMARY KEY, owner_id BIGINT, chat_id TEXT, 
                            content_type TEXT, content_text TEXT, file_id TEXT, 
@@ -153,10 +152,6 @@ def deserialize_entities(json_str):
 
 # --- UI HELPER: HYBRID FLOW ---
 async def update_menu(m, text, kb, uid, force_new=False):
-    """
-    Standard edits the menu. 
-    If force_new=True, sends a fresh message (for confirmation).
-    """
     markup = InlineKeyboardMarkup(kb) if kb else None
     
     if force_new:
@@ -165,7 +160,6 @@ async def update_menu(m, text, kb, uid, force_new=False):
             user_state[uid]["menu_msg_id"] = sent.id
         return
 
-    # Try editing existing
     st = user_state.get(uid, {})
     menu_id = st.get("menu_msg_id")
     
@@ -175,7 +169,6 @@ async def update_menu(m, text, kb, uid, force_new=False):
             return
         except: pass 
 
-    # Fallback
     sent = await app.send_message(m.chat.id, text, reply_markup=markup)
     if uid in user_state:
         user_state[uid]["menu_msg_id"] = sent.id
@@ -210,8 +203,6 @@ async def callback_router(c, q):
     d = q.data
 
     if uid not in user_state: user_state[uid] = {}
-    
-    # 📌 Capture menu ID if user clicked a button
     user_state[uid]["menu_msg_id"] = q.message.id
 
     if d == "menu_home":
@@ -227,33 +218,31 @@ async def callback_router(c, q):
         await del_session(uid)
         await update_menu(q.message, "👋 **Logged out.**\n\nUse /start to login again.", None, uid)
 
-    # [NEW] 1. View Task Details
+    # --- TASK ACTIONS ---
     elif d.startswith("view_"):
         tid = d.split("view_")[1]
         await show_task_details(uid, q.message, tid)
 
-    # [NEW] 2. Preview Message (Sends to your private chat)
     elif d.startswith("prev_"):
         tid = d.split("prev_")[1]
         task = await get_single_task(tid)
-        if task:
-            # Send copy to user to check formatting
-            await app.copy_message(chat_id=uid, from_chat_id=int(task['chat_id']), message_id=task['last_msg_id'])
-            await q.answer("✅ Preview sent to your private chat!")
+        if task and task['last_msg_id']:
+            try:
+                await app.copy_message(chat_id=uid, from_chat_id=int(task['chat_id']), message_id=task['last_msg_id'])
+                await q.answer("✅ Preview sent!")
+            except: await q.answer("❌ Cannot preview (Message not posted yet or deleted)")
         else:
-            await q.answer("❌ Task not found.")
+            await q.answer("❌ Task hasn't run yet.")
 
-    # [NEW] 3. Delete & Return to List
     elif d.startswith("del_task_"):
         tid = d.split("del_task_")[1]
         try: scheduler.remove_job(tid)
         except: pass
         chat_id = await delete_task(tid)
         await q.answer("🗑 Task Deleted!")
-        if chat_id: await list_active_tasks(uid, q.message, chat_id, force_new=False) # Return to list
+        if chat_id: await list_active_tasks(uid, q.message, chat_id, force_new=False) 
         else: await show_main_menu(q.message, uid)
 
-    # [NEW] 4. Back to List Button
     elif d.startswith("back_list_"):
         cid = d.split("back_list_")[1]
         await list_active_tasks(uid, q.message, cid, force_new=False)
@@ -296,15 +285,12 @@ async def callback_router(c, q):
         offset = d.split("time_")[1] 
         if offset == "custom":
             user_state[uid]["step"] = "waiting_custom_date"
-            
-            # Current Time Helper
             cur_time = datetime.datetime.now(IST).strftime("%d-%b %I:%M %p")
             msg_txt = (f"📅 **Select Custom Date**\n\n"
                        f"Current Time: `{cur_time}`\n"
                        f"(Tap to copy)\n\n"
                        f"Please type the date and time in this format:\n"
                        f"`{cur_time}`")
-            
             await update_menu(q.message, msg_txt, [[InlineKeyboardButton("🔙 Back", callback_data="step_time")]], uid)
             return
 
@@ -344,49 +330,29 @@ async def callback_router(c, q):
     elif d.startswith("tasks_"):
         cid = d.split("tasks_")[1]
         await list_active_tasks(uid, q.message, cid)
-    
-    elif d.startswith("del_task_"):
-        tid = d.split("del_task_")[1]
-        try: scheduler.remove_job(tid)
-        except: pass
-        chat_id = await delete_task(tid)
-        await q.answer("🗑 Task Deleted!")
-        if chat_id: await list_active_tasks(uid, q.message, chat_id)
-        else: await show_main_menu(q.message, uid)
 
 # --- INPUTS ---
 
 @app.on_message(filters.private & ~filters.command("manage") & ~filters.command("start"))
 async def handle_inputs(c, m):
     uid = m.from_user.id
-    
-    # ✅ FIX: Safe Text Extraction (Prevents Poll/Audio Crash)
     text = m.text.strip() if m.text else ""
-
-    # ✅ NO DELETION (User requested to keep history)
-    # try: await m.delete()
-    # except: pass
 
     # --- LOGIN LOGIC ---
     if uid in login_state:
         st = login_state[uid]
-        
         if st["step"] == "waiting_phone":
-            # ⏳ Loading Screen
             wait_msg = await m.reply("⏳ **Trying to connect!**\nThis can take up to 2 minutes.\n\nPlease wait...")
             try:
                 temp = Client(":memory:", api_id=API_ID, api_hash=API_HASH)
                 await temp.connect()
                 sent = await temp.send_code(text)
                 st.update({"client": temp, "phone": text, "hash": sent.phone_code_hash, "step": "waiting_code"})
-                
                 await wait_msg.delete()
-                # ✅ PROMPT FOR 'aa' CODE
                 await update_menu(m, "📩 **Step 2: Verification Code**\n\n⚠️ **IMPORTANT:** To prevent code expiry, add `aa` before the code.\n\nIf code is `12345`, send: `aa12345`", None, uid, force_new=True)
             except Exception as e: 
                 await wait_msg.delete()
                 await m.reply(f"❌ Error: {e}\nTry /start again.")
-        
         elif st["step"] == "waiting_code":
             try:
                 real_code = text.lower().replace("aa", "").strip()
@@ -395,17 +361,14 @@ async def handle_inputs(c, m):
                 await save_session(uid, sess)
                 await st["client"].disconnect()
                 del login_state[uid]
-                
                 if uid not in user_state: user_state[uid] = {}
                 kb = [[InlineKeyboardButton("🚀 Start Managing", callback_data="menu_home")]]
                 await update_menu(m, "✅ **Login Successful!**\n\nSetup complete.", kb, uid, force_new=True)
-                
             except errors.SessionPasswordNeeded:
                 st["step"] = "waiting_pass"
                 await update_menu(m, "🔐 **Step 3: 2FA Password**\n\nEnter your cloud password.", None, uid, force_new=True)
             except Exception as e:
                 await m.reply(f"❌ Error: {e}\nDid you add 'aa'?")
-
         elif st["step"] == "waiting_pass":
             try:
                 await st["client"].check_password(text)
@@ -413,7 +376,6 @@ async def handle_inputs(c, m):
                 await save_session(uid, sess)
                 await st["client"].disconnect()
                 del login_state[uid]
-                
                 kb = [[InlineKeyboardButton("🚀 Start Managing", callback_data="menu_home")]]
                 await update_menu(m, "✅ **Login Successful!**", kb, uid, force_new=True)
             except Exception as e:
@@ -452,33 +414,33 @@ async def handle_inputs(c, m):
         else:
             raw_entities = m.entities or m.caption_entities
             entities_json = serialize_entities(raw_entities)
-
-            # --- REPLACE MEDIA BLOCK WITH THIS ---
-            if m.photo:
+            
+            # Media Detection
+            media = m.media
+            if media == enums.MessageMediaType.PHOTO:
                 content_type = "photo"
                 file_id = m.photo.file_id
-            elif m.video:
+            elif media == enums.MessageMediaType.VIDEO:
                 content_type = "video"
                 file_id = m.video.file_id
-            elif m.audio:
+            elif media == enums.MessageMediaType.AUDIO:
                 content_type = "audio"
                 file_id = m.audio.file_id
-            elif m.voice:
+            elif media == enums.MessageMediaType.VOICE:
                 content_type = "voice"
                 file_id = m.voice.file_id
-            elif m.document:
+            elif media == enums.MessageMediaType.DOCUMENT:
                 content_type = "document"
                 file_id = m.document.file_id
-            elif m.sticker:
+            elif media == enums.MessageMediaType.STICKER:
                 content_type = "sticker"
                 file_id = m.sticker.file_id
-            elif m.animation:
+            elif media == enums.MessageMediaType.ANIMATION:
                 content_type = "animation"
                 file_id = m.animation.file_id
         
-        # ✅ CRITICAL FIX: Stops the bot if File ID is missing (Prevents Error)
         if content_type != "text" and content_type != "poll" and not file_id:
-            await m.reply("❌ **Error:** Media ID missing. Please try forwarding the file instead.")
+            await m.reply("❌ **Error:** Media ID missing. Please forward the file.")
             return
 
         st.update({
@@ -489,8 +451,6 @@ async def handle_inputs(c, m):
             "step": "waiting_time"
         })
         user_state[uid] = st
-        
-        # 📌 HYBRID: Send NEW message for next step
         await show_time_menu(m, uid, force_new=True)
 
     elif step == "waiting_custom_date":
@@ -500,8 +460,6 @@ async def handle_inputs(c, m):
             dt = datetime.datetime.strptime(full_str, "%Y-%d-%b %I:%M %p")
             dt = IST.localize(dt)
             user_state[uid]["start_time"] = dt
-            
-            # 📌 HYBRID: Send NEW message for next step
             await ask_repetition(m, uid, force_new=True) 
         except: 
             await m.reply("❌ Invalid Format. Use: `04-Feb 12:30 PM`")
@@ -575,7 +533,6 @@ async def confirm_task(m, uid, force_new=False):
     t_str = st["start_time"].strftime("%d-%b %I:%M %p")
     r_str = st["interval"] if st["interval"] else "Once"
     
-    # Professional Type Map
     type_map = {
         "text": "📝 Text", "photo": "📷 Photo", "video": "📹 Video",
         "audio": "🎵 Audio", "voice": "🎙 Voice", "document": "📁 File",
@@ -600,26 +557,20 @@ async def list_active_tasks(uid, m, cid, force_new=False):
         await update_menu(m, "✅ No active tasks.", [[InlineKeyboardButton("🔙 Back", callback_data=f"ch_{cid}")]], uid, force_new)
         return
     
-    # Sort tasks by time (nearest first)
     tasks.sort(key=lambda x: x['start_time'])
-    
     txt = "**📅 Scheduled Tasks:**\nSelect one to manage:"
     kb = []
     
     type_icons = {"text": "📝", "photo": "📷", "video": "📹", "audio": "🎵", "poll": "📊"}
     
     for t in tasks:
-        # Create a snippet (First 15 chars)
         snippet = (t['content_text'] or "Media")[:15] + "..."
         icon = type_icons.get(t['content_type'], "📁")
-        
-        # Format time
         try:
             dt = datetime.datetime.fromisoformat(t["start_time"])
-            time_str = dt.strftime('%I:%M %p') # e.g., 02:30 PM
+            time_str = dt.strftime('%I:%M %p') 
         except: time_str = "?"
         
-        # Button: [ 📝 Good morn... | 02:30 PM ]
         btn_text = f"{icon} {snippet} | ⏰ {time_str}"
         kb.append([InlineKeyboardButton(btn_text, callback_data=f"view_{t['task_id']}")])
         
@@ -629,10 +580,9 @@ async def list_active_tasks(uid, m, cid, force_new=False):
 async def show_task_details(uid, m, tid):
     t = await get_single_task(tid)
     if not t:
-        await update_menu(m, "❌ Task not found (maybe deleted).", [[InlineKeyboardButton("🏠 Home", callback_data="menu_home")]], uid)
+        await update_menu(m, "❌ Task not found.", [[InlineKeyboardButton("🏠 Home", callback_data="menu_home")]], uid)
         return
 
-    # Format Data
     dt = datetime.datetime.fromisoformat(t["start_time"])
     time_str = dt.strftime('%d-%b %I:%M %p')
     type_map = {"text": "📝 Text", "photo": "📷 Photo", "video": "📹 Video", "audio": "🎵 Audio", "poll": "📊 Poll"}
@@ -646,10 +596,7 @@ async def show_task_details(uid, m, tid):
            f"👇 **Select Action:**")
 
     kb = [
-        # The "Preview" Feature
-        # Note: Previewing requires the bot to copy the message. 
-        # If 'last_msg_id' isn't saved yet (not posted yet), we can't preview easily without re-uploading.
-        # So we only show Delete/Back for now unless you want advanced preview logic.
+        # [InlineKeyboardButton("👁️ Preview Msg", callback_data=f"prev_{tid}")], # Optional
         [InlineKeyboardButton("🗑 Delete Task", callback_data=f"del_task_{tid}")],
         [InlineKeyboardButton("🔙 Back to List", callback_data=f"back_list_{t['chat_id']}")]
     ]
@@ -693,7 +640,6 @@ async def create_task_logic(uid, q):
                      f"🔁 **Repeat:** `{st['interval'] or 'No'}`\n\n"
                      f"👉 Click /manage to schedule more.")
         
-        # ✅ FINAL: New Message (No Buttons, just text)
         await update_menu(q.message, final_txt, None, uid, force_new=True)
     except Exception as e:
         logger.error(f"Save Error: {e}")
@@ -754,27 +700,22 @@ def add_scheduler_job(tid, t):
                                 sent = await user.send_photo(target, t["file_id"], caption=caption, caption_entities=entities_objs)
                             elif t["content_type"] == "video":
                                 sent = await user.send_video(target, t["file_id"], caption=caption, caption_entities=entities_objs)
+                            # ✅ FIXED: Correct Logic for Audio/Voice
                             elif t["content_type"] in ["audio", "voice"]:
                                 try:
-                                    # ✅ CORRECTED: app.download_media returns BytesIO directly when in_memory=True
-                                    logger.info(f"📥 Downloading {t['content_type']} {t['file_id']}...")
-                                    media_file = await app.download_media(t["file_id"], in_memory=True)
+                                    logger.info(f"📥 Downloading {t['content_type']}...")
+                                    file_bytes = await app.download_media(t["file_id"], in_memory=True)
+                                    media_file = BytesIO(file_bytes) # Wrap in BytesIO
                                     
-                                    if not media_file:
-                                        logger.error(f"❌ Download failed for {t['file_id']}")
-                                        return
-                                    
-                                    # ✅ BytesIO is ready - set name for proper detection
                                     if t["content_type"] == "voice":
                                         media_file.name = "voice.ogg"
                                         sent = await user.send_voice(target, media_file, caption=caption)
-                                    else:  # audio
-                                        media_file.name = "audio.m4a"  # or "audio.mp3"
+                                    else:
+                                        media_file.name = "audio.mp3"
                                         sent = await user.send_audio(target, media_file, caption=caption, caption_entities=entities_objs)
-                                        
                                 except Exception as e:
-                                    logger.error(f"❌ Audio/Voice Error: {e}")
-                                    
+                                    logger.error(f"❌ Audio/Voice Upload Error: {e}")
+
                             elif t["content_type"] == "document":
                                 sent = await user.send_document(target, t["file_id"], caption=caption, caption_entities=entities_objs)
                             elif t["content_type"] == "sticker":
