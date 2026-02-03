@@ -5,6 +5,7 @@ import datetime
 import pytz
 import asyncpg
 import json
+from io import BytesIO
 from pyrogram import Client, filters, idle, errors, enums
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, MessageEntity
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -674,10 +675,23 @@ def add_scheduler_job(tid, t):
                             elif t["content_type"] == "video":
                                 sent = await user.send_video(target, t["file_id"], caption=caption, caption_entities=entities_objs)
                             # ✅ FIXED: Correct Audio/Voice Handling
-                            elif t["content_type"] == "audio":
-                                sent = await user.send_audio(target, t["file_id"], caption=caption, caption_entities=entities_objs)
-                            elif t["content_type"] == "voice":
-                                sent = await user.send_voice(target, t["file_id"], caption=caption, caption_entities=entities_objs)
+                            # ✅ PASTE THIS FIX ✅
+                            # Audio/Voice must be downloaded by Bot (app) and re-uploaded by User (user)
+                            elif t["content_type"] in ["audio", "voice"]:
+                                try:
+                                    # 1. Bot downloads the file
+                                    logger.info(f"📥 Downloading media {t['file_id']}...")
+                                    file_bytes = await app.download_media(t["file_id"], in_memory=True)
+                                    bio = BytesIO(file_bytes)
+                                    bio.name = "voice.ogg" if t["content_type"] == "voice" else "audio.mp3"
+                                    
+                                    # 2. Userbot uploads it
+                                    if t["content_type"] == "audio":
+                                        sent = await user.send_audio(target, bio, caption=caption, caption_entities=entities_objs)
+                                    else:
+                                        sent = await user.send_voice(target, bio, caption=caption, caption_entities=entities_objs)
+                                except Exception as e:
+                                    logger.error(f"❌ Audio Upload Failed: {e}")
                             elif t["content_type"] == "document":
                                 sent = await user.send_document(target, t["file_id"], caption=caption, caption_entities=entities_objs)
                             elif t["content_type"] == "sticker":
