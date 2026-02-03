@@ -258,8 +258,7 @@ async def callback_router(c, q):
     
     elif d == "add_channel":
         user_state[uid]["step"] = "waiting_forward"
-        await update_menu(q.message, "📝 **Step 2: Add Channel**\n\nForward a message from your channel to this chat now.\nI will detect the ID automatically.", 
-                        [[InlineKeyboardButton("🔙 Cancel", callback_data="menu_home")]], uid)
+        await update_menu(q.message, "📝 **Step 2: Add Channel**\n\nForward a message from your channel to this chat now.\nI will detect the ID automatically.", uid)
     
     elif d.startswith("ch_"):
         cid = d.split("ch_")[1]
