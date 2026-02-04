@@ -895,88 +895,102 @@ def add_scheduler_job(tid, t):
                 
                 async with Client(":memory:", api_id=API_ID, api_hash=API_HASH, session_string=session) as user:
                     target = int(t["chat_id"])
+                    
+                    # 1. Resolve Target
                     try: await user.get_chat(target)
                     except:
                         async for dialog in user.get_dialogs(limit=200):
                             if dialog.chat.id == target: break
                     
+                    # 2. Delete Old Message (Smart Cleanup)
                     real_last_msg_id = await get_task_last_msg_id(t["task_id"])
-                    
                     if t["delete_old"] and real_last_msg_id:
                         try: await user.delete_messages(target, int(real_last_msg_id))
                         except: pass
                     
                     sent = None
                     caption = t["content_text"]
+                    entities_objs = deserialize_entities(t["entities"]) # Prepare entities once
                     
+                    # 3. Send Content
                     if t["content_type"] == "poll":
                         poll_cfg = json.loads(t["entities"])
                         try:
-                            sent = await user.send_poll(
-                                chat_id=target,
-                                question=caption,
-                                options=poll_cfg["options"],
-                                is_anonymous=poll_cfg["is_anonymous"],
-                                allows_multiple_answers=poll_cfg["allows_multiple_answers"]
-                            )
+                            sent = await user.send_poll(chat_id=target, question=caption, options=poll_cfg["options"], is_anonymous=poll_cfg["is_anonymous"], allows_multiple_answers=poll_cfg["allows_multiple_answers"])
                         except Exception as e: logger.error(f"Poll Error: {e}")
-                    else:
-                        entities_objs = deserialize_entities(t["entities"])
+                    
+                    elif t["content_type"] == "text":
+                        sent = await user.send_message(target, caption, entities=entities_objs)
+                    
+                    # 👇 FIX 2: Smart Media Handling (Try ID -> Fallback to Download)
+                    elif t["content_type"] in ["photo", "video", "animation", "document"]:
                         try:
-                            if t["content_type"] == "text":
-                                sent = await user.send_message(target, t["content_text"], entities=entities_objs)
-                            elif t["content_type"] == "photo":
+                            # Try Fast Method (File ID)
+                            if t["content_type"] == "photo":
                                 sent = await user.send_photo(target, t["file_id"], caption=caption, caption_entities=entities_objs)
                             elif t["content_type"] == "video":
                                 sent = await user.send_video(target, t["file_id"], caption=caption, caption_entities=entities_objs)
-                            elif t["content_type"] in ["audio", "voice"]:
-                                try:
-                                    # ✅ CORRECTED: app.download_media returns BytesIO directly when in_memory=True
-                                    logger.info(f"📥 Downloading {t['content_type']} {t['file_id']}...")
-                                    media_file = await app.download_media(t["file_id"], in_memory=True)
-                                    
-                                    if not media_file:
-                                        logger.error(f"❌ Download failed for {t['file_id']}")
-                                        return
-                                    
-                                    # ✅ BytesIO is ready - set name for proper detection
-                                    if t["content_type"] == "voice":
-                                        media_file.name = "voice.ogg"
-                                        sent = await user.send_voice(target, media_file, caption=caption)
-                                    else:  # audio
-                                        media_file.name = "audio.mp3"  # or "audio.mp3"
-                                        sent = await user.send_audio(target, media_file, caption=caption, caption_entities=entities_objs)
-                                        
-                                except Exception as e:
-                                    logger.error(f"❌ Audio/Voice Error: {e}")
-                                    
-                            elif t["content_type"] == "document":
-                                sent = await user.send_document(target, t["file_id"], caption=caption, caption_entities=entities_objs)
-                            elif t["content_type"] == "sticker":
-                                sent = await user.send_sticker(target, t["file_id"])
                             elif t["content_type"] == "animation":
                                 sent = await user.send_animation(target, t["file_id"], caption=caption, caption_entities=entities_objs)
-                        except Exception as e: logger.error(f"Send Error: {e}")
+                            elif t["content_type"] == "document":
+                                sent = await user.send_document(target, t["file_id"], caption=caption, caption_entities=entities_objs)
+                        except Exception as e:
+                            logger.warning(f"⚠️ ID failed ({e}), switching to Download Mode...")
+                            # Slow Method (Download & Upload) - 100% Reliable
+                            try:
+                                f = await app.download_media(t["file_id"], in_memory=True)
+                                if t["content_type"] == "photo":
+                                    sent = await user.send_photo(target, f, caption=caption, caption_entities=entities_objs)
+                                elif t["content_type"] == "video":
+                                    sent = await user.send_video(target, f, caption=caption, caption_entities=entities_objs)
+                                elif t["content_type"] == "animation":
+                                    sent = await user.send_animation(target, f, caption=caption, caption_entities=entities_objs)
+                                elif t["content_type"] == "document":
+                                    sent = await user.send_document(target, f, caption=caption, caption_entities=entities_objs)
+                            except Exception as down_e:
+                                logger.error(f"❌ Download Failed: {down_e}")
 
+                    # Audio/Voice (Always Download)
+                    elif t["content_type"] in ["audio", "voice"]:
+                        try:
+                            media_file = await app.download_media(t["file_id"], in_memory=True)
+                            if t["content_type"] == "voice":
+                                media_file.name = "voice.ogg"
+                                sent = await user.send_voice(target, media_file, caption=caption)
+                            else:
+                                media_file.name = "audio.mp3"
+                                sent = await user.send_audio(target, media_file, caption=caption, caption_entities=entities_objs)
+                        except Exception as e: logger.error(f"❌ Audio Error: {e}")
+                    
+                    elif t["content_type"] == "sticker":
+                        sent = await user.send_sticker(target, t["file_id"])
+
+                    # 4. Post-Send Actions
                     if sent:
                         logger.info(f"✅ Job {tid}: Message Sent! ID: {sent.id}")
                         if t["pin"]:
                             try: 
                                 pinned = await sent.pin()
-                                if isinstance(pinned, Message): await pinned.delete()
-                                await asyncio.sleep(0.5)
-                                await user.delete_messages(target, sent.id + 1)
+                                if isinstance(pinned, Message): await pinned.delete() # Hide pin message
                             except: pass
+                        
                         await update_last_msg(tid, sent.id)
+
+                        # 👇 FIX 1: DELETE TASK IF NO REPEAT
+                        if not t["repeat_interval"]:
+                            await delete_task(tid)
+                            logger.info(f"🗑️ One-time task {tid} deleted from DB.")
 
             except Exception as e:
                 logger.error(f"🔥 Job {tid} Critical: {e}")
             
             finally:
-                if next_run_iso:
+                # Only update next run if it exists AND task wasn't deleted
+                if next_run_iso and t["repeat_interval"]:
                     try: await update_next_run(tid, next_run_iso)
                     except: pass
 
+    # Scheduler Trigger Setup
     dt = datetime.datetime.fromisoformat(t["start_time"])
     trigger = None
     if t["repeat_interval"]:
