@@ -361,15 +361,20 @@ async def callback_router(c, q):
             one_time_keyboard=True
         )
         
-        await app.send_message(
-            q.message.chat.id, 
-            f"📢 **Multi-Post Mode Active**\n\n"
-            f"You have selected **{len(targets)} channels**.\n"
-            f"👇 **Instructions:**\n"
-            f"1. Send your posts one by one (Text, Photo, Video, etc).\n"
-            f"2. When finished, click the **✅ Done Adding Posts** button below.",
-            reply_markup=markup
+        # 👇 Detailed User Guide
+        guide_text = (
+            f"📢 **Multi-Post Mode Active**\n"
+            f"Selected: **{len(targets)} Channels**\n\n"
+            
+            f"👇 **How to Use:**\n"
+            f"1️⃣ **Send Posts:** Send text, photos, or videos one by one.\n"
+            f"2️⃣ **Create Threads:** If you want Post B to reply to Post A, simply **reply to Post A** right here!\n"
+            f"3️⃣ **Finish:** Click **✅ Done** when finished.\n\n"
+            
+            f"⚙️ *You can configure Pin/Delete settings for each post individually after adding them.*"
         )
+        
+        await app.send_message(q.message.chat.id, guide_text, reply_markup=markup)
 
     # --- CHANNEL MANAGEMENT ---
     elif d == "list_channels":
@@ -905,7 +910,7 @@ async def create_task_logic(uid, q):
             "content_text": st["content_text"],
             "file_id": st["file_id"],
             "entities": st.get("entities"),
-            "input_msg_id": 0, "reply_ref_id": None # Dummy data
+            "input_msg_id": 0, "reply_ref_id": None 
         }]
 
     base_tid = int(datetime.datetime.now().timestamp())
@@ -915,30 +920,25 @@ async def create_task_logic(uid, q):
     # Loop Channels
     for ch_idx, cid in enumerate(targets):
         
-        # 1. First Pass: Generate IDs for all posts in this channel
-        # We need to know all Task IDs beforehand to link them.
-        batch_map = {} # Maps input_msg_id -> generated_task_id
-        
+        # 1. First Pass: Map Input IDs to Task IDs
+        batch_map = {} 
         for post_idx, post in enumerate(queue):
             tid = f"task_{base_tid}_{ch_idx}_{post_idx}"
             if "input_msg_id" in post:
                 batch_map[post["input_msg_id"]] = tid
 
-        # 2. Second Pass: Create and Save Tasks
+        # 2. Second Pass: Create Tasks
         for post_idx, post in enumerate(queue):
             tid = f"task_{base_tid}_{ch_idx}_{post_idx}"
-            run_time = st["start_time"] + datetime.timedelta(seconds=post_idx * 2)
             
-            # 👇 SMART LINKING LOGIC
+            # 👇 FIX: Increased delay to 10 seconds to prevent Reply Race Conditions
+            run_time = st["start_time"] + datetime.timedelta(seconds=post_idx * 10)
+            
+            # SMART LINKING
             target_tid = None
-            
-            # A. If user explicitly replied to a message in the setup chat
             if post.get("reply_ref_id") and post["reply_ref_id"] in batch_map:
                 target_tid = batch_map[post["reply_ref_id"]]
-            
-            # B. OR if "Reply to Previous" toggle was used in settings (Fallback)
             elif post.get("reply_to_old") and post_idx > 0:
-                # Link to the immediate previous task
                 target_tid = f"task_{base_tid}_{ch_idx}_{post_idx-1}"
 
             task_data = {
@@ -954,7 +954,6 @@ async def create_task_logic(uid, q):
                 "repeat_interval": st["interval"],
                 "start_time": run_time.isoformat(),
                 "last_msg_id": None,
-                # 👇 SAVE THE LINK
                 "reply_target": target_tid
             }
             
@@ -972,7 +971,7 @@ async def create_task_logic(uid, q):
     final_txt = (f"🎉 **Broadcast Scheduled!**\n\n"
                  f"📢 **Channels:** `{len(targets)}`\n"
                  f"📬 **Posts per Channel:** `{len(queue)}`\n"
-                 f"🔢 **Total Tasks:** `{total_tasks}`\n"
+                 f"⏱️ **Post Gap:** `10 seconds` (Safe Mode)\n"
                  f"📅 **Start Time:** `{t_str}`\n\n"
                  f"👉 Click /manage to schedule more.")
 
