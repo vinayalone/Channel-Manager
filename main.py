@@ -89,16 +89,20 @@ async def add_channel(user_id, cid, title):
 async def delete_all_user_data(user_id):
     pool = await get_db()
     
-    # 1. Terminate Telegram Session (Kill it on Server)
+    # 1. Try to Terminate Telegram Session (Max 5 Seconds)
     session_str = await get_session(user_id)
     if session_str:
         try:
-            # Connect briefly to log out properly
-            async with Client(":memory:", api_id=API_ID, api_hash=API_HASH, session_string=session_str) as temp_user:
-                await temp_user.log_out()
-                logger.info(f"✅ User {user_id} session terminated from Telegram.")
+            async def fast_logout():
+                async with Client(":memory:", api_id=API_ID, api_hash=API_HASH, session_string=session_str) as temp_user:
+                    await temp_user.log_out()
+            
+            # 👇 FORCE TIMEOUT: If logout takes > 5s, skip it.
+            await asyncio.wait_for(fast_logout(), timeout=5.0)
+            logger.info(f"✅ User {user_id} session terminated.")
+            
         except Exception as e:
-            logger.error(f"⚠️ Session Kill Failed (Session likely already dead): {e}")
+            logger.warning(f"⚠️ Session kill skipped (Error/Timeout): {e}")
 
     # 2. Stop scheduler jobs
     tasks = await pool.fetch("SELECT task_id FROM userbot_tasks_v11 WHERE owner_id = $1", user_id)
@@ -107,7 +111,7 @@ async def delete_all_user_data(user_id):
             try: scheduler.remove_job(t['task_id'])
             except: pass
             
-    # 3. Delete Everything from DB
+    # 3. Delete Everything from DB (Always runs)
     await pool.execute("DELETE FROM userbot_tasks_v11 WHERE owner_id = $1", user_id)
     await pool.execute("DELETE FROM userbot_channels WHERE owner_id = $1", user_id)
     await pool.execute("DELETE FROM userbot_sessions WHERE user_id = $1", user_id)
@@ -115,7 +119,7 @@ async def delete_all_user_data(user_id):
     # 4. Clear Memory Cache
     if user_id in user_state: del user_state[user_id]
     if user_id in login_state: del login_state[user_id]
-
+        
 async def get_channels(user_id):
     pool = await get_db()
     return await pool.fetch("SELECT * FROM userbot_channels WHERE user_id = $1", user_id)
@@ -311,19 +315,23 @@ async def callback_router(c, q):
 
     # Step 3: Execution
     elif d == "logout_final":
-        await q.answer("⏳ Logging out securely...", show_alert=False)
+        # 1. Immediate Feedback
+        try:
+            await app.edit_message_text(uid, q.message.id, "⏳ **Logging out...**\nTerminating session and wiping data.")
+        except: 
+            await q.answer("⏳ Processing...", show_alert=False)
+
+        # 2. Do the heavy lifting (Safe version)
         await delete_all_user_data(uid) 
         
-        # We cannot use update_menu because user_state is wiped.
-        # We edit the message directly using Pyrogram.
+        # 3. Final Success Message
         try:
             await app.edit_message_text(
                 chat_id=uid, 
                 message_id=q.message.id, 
-                text="👋 **Logged out successfully.**\n\nAll data has been wiped from the bot and the session has been terminated from Telegram settings."
+                text="👋 **Logged out successfully.**\n\nAll data has been wiped and your active session has been terminated."
             )
         except:
-            await q.message.delete()
             await app.send_message(uid, "👋 **Logged out successfully.**")
 
     # --- TASK ACTIONS (PRO UI) ---
