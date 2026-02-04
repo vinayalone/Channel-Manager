@@ -197,7 +197,6 @@ async def update_menu(m, text, kb, uid, force_new=False):
         user_state[uid]["menu_msg_id"] = sent.id
 
 # --- BOT INTERFACE ---
-
 @app.on_message(filters.command("manage") | filters.command("start"))
 async def start_cmd(c, m):
     uid = m.from_user.id
@@ -219,6 +218,27 @@ async def start_cmd(c, m):
             "👇 **Click Login to get started.**",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Login Account", callback_data="login_start")]])
         )
+
+async def show_broadcast_selection(uid, m):
+    chs = await get_channels(uid)
+    if not chs:
+        await update_menu(m, "❌ No channels found.", [[InlineKeyboardButton("🔙 Back", callback_data="menu_home")]], uid)
+        return
+
+    targets = user_state[uid].get("broadcast_targets", [])
+    kb = []
+    
+    # Create Toggle Buttons
+    for c in chs:
+        is_selected = c['channel_id'] in targets
+        icon = "✅" if is_selected else "⬜"
+        kb.append([InlineKeyboardButton(f"{icon} {c['title']}", callback_data=f"toggle_bc_{c['channel_id']}")])
+    
+    # Done Button
+    kb.append([InlineKeyboardButton(f"➡️ Done ({len(targets)} Selected)", callback_data="broadcast_confirm")])
+    kb.append([InlineKeyboardButton("🔙 Cancel", callback_data="menu_home")])
+    
+    await update_menu(m, "📢 **Broadcast Mode**\n\nSelect channels to post to:", kb, uid)
 
 @app.on_callback_query()
 async def callback_router(c, q):
@@ -430,27 +450,6 @@ async def callback_router(c, q):
     elif d.startswith("tasks_"):
         cid = d.split("tasks_")[1]
         await list_active_tasks(uid, q.message, cid)
-
-async def show_broadcast_selection(uid, m):
-    chs = await get_channels(uid)
-    if not chs:
-        await update_menu(m, "❌ No channels found.", [[InlineKeyboardButton("🔙 Back", callback_data="menu_home")]], uid)
-        return
-
-    targets = user_state[uid].get("broadcast_targets", [])
-    kb = []
-    
-    # Create Toggle Buttons
-    for c in chs:
-        is_selected = c['channel_id'] in targets
-        icon = "✅" if is_selected else "⬜"
-        kb.append([InlineKeyboardButton(f"{icon} {c['title']}", callback_data=f"toggle_bc_{c['channel_id']}")])
-    
-    # Done Button
-    kb.append([InlineKeyboardButton(f"➡️ Done ({len(targets)} Selected)", callback_data="broadcast_confirm")])
-    kb.append([InlineKeyboardButton("🔙 Cancel", callback_data="menu_home")])
-    
-    await update_menu(m, "📢 **Broadcast Mode**\n\nSelect channels to post to:", kb, uid)
 
 # --- INPUTS ---
 @app.on_message(filters.private & ~filters.command("manage") & ~filters.command("start"))
