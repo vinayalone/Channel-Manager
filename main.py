@@ -97,6 +97,7 @@ async def delete_all_user_data(user_id):
                 # 👇 CHANGED: Added Custom Device & App Names here
                 async with Client(":memory:", api_id=API_ID, api_hash=API_HASH, session_string=session_str,
                                   device_model="AutoCast Client", 
+                                  system_version="PC",
                                   app_version="AutoCast Version") as temp_user:
                     await temp_user.log_out()
             
@@ -557,7 +558,8 @@ async def handle_inputs(c, m):
             try:
                 # 👇 CHANGED: Added Custom Device & App Names here
                 temp = Client(":memory:", api_id=API_ID, api_hash=API_HASH, 
-                              device_model="AutoCast Client", 
+                              device_model="AutoCast Client",
+                              system_version="PC", 
                               app_version="AutoCast Version")
                 
                 await temp.connect()
@@ -1044,6 +1046,7 @@ def add_scheduler_job(tid, t):
                 # 👇 CHANGED: Added Custom Device & App Names here
                 async with Client(":memory:", api_id=API_ID, api_hash=API_HASH, session_string=session,
                                   device_model="AutoCast Client", 
+                                  system_version="PC",
                                   app_version="AutoCast Version") as user:
                     target = int(t["chat_id"])
                     
