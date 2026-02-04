@@ -860,7 +860,6 @@ async def create_task_logic(uid, q):
                  f"📅 **Start Time:** `{t_str}`")
 
     await update_menu(q.message, final_txt, None, uid, force_new=False)
-
     except Exception as e:
         logger.error(f"Save Error: {e}")
         await q.message.edit_text(f"❌ Error: {e}")
