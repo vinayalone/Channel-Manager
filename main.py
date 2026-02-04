@@ -47,14 +47,26 @@ async def get_db():
 async def init_db():
     pool = await get_db()
     async with pool.acquire() as conn:
-        await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_sessions (user_id BIGINT PRIMARY KEY, session_string TEXT)''')
-        await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_channels (user_id BIGINT, channel_id TEXT, title TEXT, PRIMARY KEY(user_id, channel_id))''')
         await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_tasks_v11
-                          (task_id TEXT PRIMARY KEY, owner_id BIGINT, chat_id TEXT, 
-                           content_type TEXT, content_text TEXT, file_id TEXT, 
-                           entities TEXT, 
-                           pin BOOLEAN, delete_old BOOLEAN, 
-                           repeat_interval TEXT, start_time TEXT, last_msg_id BIGINT)''')
+                           (task_id TEXT PRIMARY KEY, owner_id BIGINT, chat_id TEXT, 
+                            content_type TEXT, content_text TEXT, file_id TEXT, 
+                            entities TEXT, 
+                            pin BOOLEAN, delete_old BOOLEAN, 
+                            repeat_interval TEXT, start_time TEXT, last_msg_id BIGINT)''')
+        
+        # 👇 NEW: Add 'reply_target' column (Stores the Task ID to reply to)
+        try: await conn.execute("ALTER TABLE userbot_tasks_v11 ADD COLUMN IF NOT EXISTS reply_target TEXT")
+        except: pass
+
+async def save_task(t):
+    pool = await get_db()
+    await pool.execute("""
+        INSERT INTO userbot_tasks_v11 (task_id, owner_id, chat_id, content_type, content_text, file_id, entities, pin, delete_old, repeat_interval, start_time, last_msg_id, reply_target)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        ON CONFLICT (task_id) DO UPDATE SET last_msg_id = $12, start_time = $11
+    """, t['task_id'], t['owner_id'], t['chat_id'], t['content_type'], t['content_text'], t['file_id'], 
+       t['entities'], t['pin'], t['delete_old'], t['repeat_interval'], t['start_time'], t['last_msg_id'], 
+       t.get('reply_target'))
 
 # --- DB HELPERS ---
 async def get_session(user_id):
@@ -106,14 +118,6 @@ async def del_channel(user_id, cid):
     await pool.execute("DELETE FROM userbot_tasks_v11 WHERE chat_id = $1", cid)
     # 4. Finally, Delete the Channel itself
     await pool.execute("DELETE FROM userbot_channels WHERE user_id = $1 AND channel_id = $2", user_id, cid)
-
-async def save_task(t):
-    pool = await get_db()
-    await pool.execute("""
-        INSERT INTO userbot_tasks_v11 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-        ON CONFLICT (task_id) DO UPDATE SET last_msg_id = $12, start_time = $11
-    """, t['task_id'], t['owner_id'], t['chat_id'], t['content_type'], t['content_text'], t['file_id'], 
-       t['entities'], t['pin'], t['delete_old'], t['repeat_interval'], t['start_time'], t['last_msg_id'])
 
 async def get_all_tasks():
     pool = await get_db()
@@ -612,16 +616,22 @@ async def handle_inputs(c, m):
             await m.reply("❌ Unsupported media. Send Text, Photo, Video, Audio, or Document.")
             return
 
-        # Add to Queue
+        # Check if this message is a reply to a previous input
+        reply_ref_id = None
+        if m.reply_to_message:
+            reply_ref_id = m.reply_to_message.id
+
         # Add to Queue
         post_data = {
             "content_type": content_type,
             "content_text": content_text,
             "file_id": file_id,
             "entities": entities_json,
-            # 👇 NEW: Add defaults here
             "pin": True,
-            "delete_old": True
+            "delete_old": True,
+            # 👇 Store Input IDs to track connections
+            "input_msg_id": m.id,      # The ID of this message
+            "reply_ref_id": reply_ref_id # The ID it replied to (if any)
         }
         st.setdefault("broadcast_queue", []).append(post_data)
         
@@ -886,31 +896,51 @@ async def show_task_details(uid, m, tid):
 async def create_task_logic(uid, q):
     st = user_state[uid]
     targets = st.get("broadcast_targets", [st.get("target")])
-    queue = st.get("broadcast_queue") # <--- Get the queue
+    queue = st.get("broadcast_queue")
 
-    # If no queue (Single post mode), make a fake queue of 1 item
+    # Single post fallback
     if not queue:
         queue = [{
             "content_type": st["content_type"],
             "content_text": st["content_text"],
             "file_id": st["file_id"],
-            "entities": st.get("entities")
+            "entities": st.get("entities"),
+            "input_msg_id": 0, "reply_ref_id": None # Dummy data
         }]
 
     base_tid = int(datetime.datetime.now().timestamp())
     t_str = st["start_time"].strftime("%d-%b %I:%M %p")
     total_tasks = 0
 
-    # Double Loop: For Every Channel -> For Every Post
+    # Loop Channels
     for ch_idx, cid in enumerate(targets):
+        
+        # 1. First Pass: Generate IDs for all posts in this channel
+        # We need to know all Task IDs beforehand to link them.
+        batch_map = {} # Maps input_msg_id -> generated_task_id
+        
         for post_idx, post in enumerate(queue):
-            
-            # Unique ID: task_TIMESTAMP_CHANNEL_POST
             tid = f"task_{base_tid}_{ch_idx}_{post_idx}"
-            
-            # Calculate Time Offset (Add 2 seconds between posts to keep order)
+            if "input_msg_id" in post:
+                batch_map[post["input_msg_id"]] = tid
+
+        # 2. Second Pass: Create and Save Tasks
+        for post_idx, post in enumerate(queue):
+            tid = f"task_{base_tid}_{ch_idx}_{post_idx}"
             run_time = st["start_time"] + datetime.timedelta(seconds=post_idx * 2)
             
+            # 👇 SMART LINKING LOGIC
+            target_tid = None
+            
+            # A. If user explicitly replied to a message in the setup chat
+            if post.get("reply_ref_id") and post["reply_ref_id"] in batch_map:
+                target_tid = batch_map[post["reply_ref_id"]]
+            
+            # B. OR if "Reply to Previous" toggle was used in settings (Fallback)
+            elif post.get("reply_to_old") and post_idx > 0:
+                # Link to the immediate previous task
+                target_tid = f"task_{base_tid}_{ch_idx}_{post_idx-1}"
+
             task_data = {
                 "task_id": tid,
                 "owner_id": uid,
@@ -923,7 +953,9 @@ async def create_task_logic(uid, q):
                 "delete_old": post.get("delete_old", st.get("del", True)),
                 "repeat_interval": st["interval"],
                 "start_time": run_time.isoformat(),
-                "last_msg_id": None
+                "last_msg_id": None,
+                # 👇 SAVE THE LINK
+                "reply_target": target_tid
             }
             
             try:
@@ -952,6 +984,8 @@ def add_scheduler_job(tid, t):
     async def job_func():
         async with queue_lock:
             logger.info(f"🚀 JOB {tid} TRIGGERED")
+            
+            # 1. Calculate Next Run (For Repeating Tasks)
             next_run_iso = None
             if t["repeat_interval"]:
                 try:
@@ -962,93 +996,124 @@ def add_scheduler_job(tid, t):
                 except: pass
 
             try:
+                # 2. Login as User
                 session = await get_session(t["owner_id"])
                 if not session: return 
                 
                 async with Client(":memory:", api_id=API_ID, api_hash=API_HASH, session_string=session) as user:
                     target = int(t["chat_id"])
                     
-                    # 1. Resolve Target
+                    # 3. Resolve Chat
                     try: await user.get_chat(target)
                     except:
                         async for dialog in user.get_dialogs(limit=200):
                             if dialog.chat.id == target: break
                     
-                    # 2. Delete Old Message (Smart Cleanup)
+                    # 4. Determine Reply Target (Smart Linking)
+                    reply_id = None
+                    if t.get("reply_target"):
+                        # If this task is linked to another task (e.g., Post 5 -> Post 1)
+                        # We fetch the Message ID that Post 1 sent.
+                        target_msg_id = await get_task_last_msg_id(t["reply_target"])
+                        if target_msg_id:
+                            reply_id = int(target_msg_id)
+                    
+                    # 5. Delete Old Message (Cleanup Previous Run)
                     real_last_msg_id = await get_task_last_msg_id(t["task_id"])
+                    
+                    # Safe Delete: Only delete if we have an old ID.
                     if t["delete_old"] and real_last_msg_id:
-                        try: await user.delete_messages(target, int(real_last_msg_id))
-                        except: pass
+                         # Safety check: Don't delete the message we are about to reply to (rare edge case)
+                         if real_last_msg_id != reply_id:
+                            try: await user.delete_messages(target, int(real_last_msg_id))
+                            except: pass
                     
                     sent = None
                     caption = t["content_text"]
-                    entities_objs = deserialize_entities(t["entities"]) # Prepare entities once
+                    entities_objs = deserialize_entities(t["entities"])
                     
-                    # 3. Send Content
+                    # 6. Send Content (The Heavy Logic)
+                    
+                    # --- A. POLL ---
                     if t["content_type"] == "poll":
                         poll_cfg = json.loads(t["entities"])
                         try:
-                            sent = await user.send_poll(chat_id=target, question=caption, options=poll_cfg["options"], is_anonymous=poll_cfg["is_anonymous"], allows_multiple_answers=poll_cfg["allows_multiple_answers"])
+                            sent = await user.send_poll(
+                                chat_id=target, 
+                                question=caption, 
+                                options=poll_cfg["options"], 
+                                is_anonymous=poll_cfg["is_anonymous"], 
+                                allows_multiple_answers=poll_cfg["allows_multiple_answers"],
+                                reply_to_message_id=reply_id
+                            )
                         except Exception as e: logger.error(f"Poll Error: {e}")
                     
+                    # --- B. TEXT ---
                     elif t["content_type"] == "text":
-                        sent = await user.send_message(target, caption, entities=entities_objs)
+                        sent = await user.send_message(target, caption, entities=entities_objs, reply_to_message_id=reply_id)
                     
-                    # 👇 FIX 2: Smart Media Handling (Try ID -> Fallback to Download)
+                    # --- C. MEDIA (Photo, Video, Animation, Document) ---
+                    # Strategy: Try File ID first (Fast). If fails, Download & Upload (Reliable).
                     elif t["content_type"] in ["photo", "video", "animation", "document"]:
                         try:
-                            # Try Fast Method (File ID)
+                            # Attempt 1: Fast Send (File ID)
                             if t["content_type"] == "photo":
-                                sent = await user.send_photo(target, t["file_id"], caption=caption, caption_entities=entities_objs)
+                                sent = await user.send_photo(target, t["file_id"], caption=caption, caption_entities=entities_objs, reply_to_message_id=reply_id)
                             elif t["content_type"] == "video":
-                                sent = await user.send_video(target, t["file_id"], caption=caption, caption_entities=entities_objs)
+                                sent = await user.send_video(target, t["file_id"], caption=caption, caption_entities=entities_objs, reply_to_message_id=reply_id)
                             elif t["content_type"] == "animation":
-                                sent = await user.send_animation(target, t["file_id"], caption=caption, caption_entities=entities_objs)
+                                sent = await user.send_animation(target, t["file_id"], caption=caption, caption_entities=entities_objs, reply_to_message_id=reply_id)
                             elif t["content_type"] == "document":
-                                sent = await user.send_document(target, t["file_id"], caption=caption, caption_entities=entities_objs)
+                                sent = await user.send_document(target, t["file_id"], caption=caption, caption_entities=entities_objs, reply_to_message_id=reply_id)
+                        
                         except Exception as e:
-                            logger.warning(f"⚠️ ID failed ({e}), switching to Download Mode...")
-                            # Slow Method (Download & Upload) - 100% Reliable
+                            logger.warning(f"⚠️ ID failed for {t['content_type']} ({e}). Switching to Download Mode...")
+                            # Attempt 2: Slow Send (Download -> Upload)
                             try:
                                 f = await app.download_media(t["file_id"], in_memory=True)
                                 if t["content_type"] == "photo":
-                                    sent = await user.send_photo(target, f, caption=caption, caption_entities=entities_objs)
+                                    sent = await user.send_photo(target, f, caption=caption, caption_entities=entities_objs, reply_to_message_id=reply_id)
                                 elif t["content_type"] == "video":
-                                    sent = await user.send_video(target, f, caption=caption, caption_entities=entities_objs)
+                                    sent = await user.send_video(target, f, caption=caption, caption_entities=entities_objs, reply_to_message_id=reply_id)
                                 elif t["content_type"] == "animation":
-                                    sent = await user.send_animation(target, f, caption=caption, caption_entities=entities_objs)
+                                    sent = await user.send_animation(target, f, caption=caption, caption_entities=entities_objs, reply_to_message_id=reply_id)
                                 elif t["content_type"] == "document":
-                                    sent = await user.send_document(target, f, caption=caption, caption_entities=entities_objs)
+                                    sent = await user.send_document(target, f, caption=caption, caption_entities=entities_objs, reply_to_message_id=reply_id)
                             except Exception as down_e:
                                 logger.error(f"❌ Download Failed: {down_e}")
 
-                    # Audio/Voice (Always Download)
+                    # --- D. AUDIO / VOICE (Always Download) ---
+                    # File IDs for voice/audio are often tricky between bots/users, so we default to download.
                     elif t["content_type"] in ["audio", "voice"]:
                         try:
                             media_file = await app.download_media(t["file_id"], in_memory=True)
                             if t["content_type"] == "voice":
                                 media_file.name = "voice.ogg"
-                                sent = await user.send_voice(target, media_file, caption=caption)
+                                sent = await user.send_voice(target, media_file, caption=caption, reply_to_message_id=reply_id)
                             else:
                                 media_file.name = "audio.mp3"
-                                sent = await user.send_audio(target, media_file, caption=caption, caption_entities=entities_objs)
-                        except Exception as e: logger.error(f"❌ Audio Error: {e}")
+                                sent = await user.send_audio(target, media_file, caption=caption, caption_entities=entities_objs, reply_to_message_id=reply_id)
+                        except Exception as e: logger.error(f"❌ Audio/Voice Error: {e}")
                     
+                    # --- E. STICKER ---
                     elif t["content_type"] == "sticker":
-                        sent = await user.send_sticker(target, t["file_id"])
+                        sent = await user.send_sticker(target, t["file_id"], reply_to_message_id=reply_id)
 
-                    # 4. Post-Send Actions
+                    # 7. Post-Send Actions
                     if sent:
                         logger.info(f"✅ Job {tid}: Message Sent! ID: {sent.id}")
+                        
+                        # Pinning (if enabled)
                         if t["pin"]:
                             try: 
                                 pinned = await sent.pin()
-                                if isinstance(pinned, Message): await pinned.delete() # Hide pin message
+                                if isinstance(pinned, Message): await pinned.delete() # Hide the "Pinned" service message
                             except: pass
                         
+                        # Update DB with new Message ID
                         await update_last_msg(tid, sent.id)
 
-                        # 👇 FIX 1: DELETE TASK IF NO REPEAT
+                        # Auto-Delete Task from DB if it is NOT repeating
                         if not t["repeat_interval"]:
                             await delete_task(tid)
                             logger.info(f"🗑️ One-time task {tid} deleted from DB.")
@@ -1057,12 +1122,12 @@ def add_scheduler_job(tid, t):
                 logger.error(f"🔥 Job {tid} Critical: {e}")
             
             finally:
-                # Only update next run if it exists AND task wasn't deleted
+                # Update Next Run Time (for repeating tasks)
                 if next_run_iso and t["repeat_interval"]:
                     try: await update_next_run(tid, next_run_iso)
                     except: pass
 
-    # Scheduler Trigger Setup
+    # 8. Setup Scheduler Trigger
     dt = datetime.datetime.fromisoformat(t["start_time"])
     trigger = None
     if t["repeat_interval"]:
