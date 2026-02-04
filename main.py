@@ -97,7 +97,7 @@ async def delete_all_user_data(user_id):
                 async with Client(":memory:", api_id=API_ID, api_hash=API_HASH, session_string=session_str) as temp_user:
                     await temp_user.log_out()
             
-            # 👇 FORCE TIMEOUT: If logout takes > 5s, skip it.
+            # Force Timeout to prevent hanging
             await asyncio.wait_for(fast_logout(), timeout=5.0)
             logger.info(f"✅ User {user_id} session terminated.")
             
@@ -111,9 +111,12 @@ async def delete_all_user_data(user_id):
             try: scheduler.remove_job(t['task_id'])
             except: pass
             
-    # 3. Delete Everything from DB (Always runs)
+    # 3. Delete Everything from DB (Fixed Column Name)
     await pool.execute("DELETE FROM userbot_tasks_v11 WHERE owner_id = $1", user_id)
-    await pool.execute("DELETE FROM userbot_channels WHERE owner_id = $1", user_id)
+    
+    # 👇 FIX: Changed 'owner_id' to 'user_id' because that is the column name in this table
+    await pool.execute("DELETE FROM userbot_channels WHERE user_id = $1", user_id) 
+    
     await pool.execute("DELETE FROM userbot_sessions WHERE user_id = $1", user_id)
 
     # 4. Clear Memory Cache
