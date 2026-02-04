@@ -203,8 +203,11 @@ async def start_cmd(c, m):
     if uid not in user_state: user_state[uid] = {}
     
     if await get_session(uid):
-        kb = [[InlineKeyboardButton("📢 My Channels", callback_data="list_channels"), InlineKeyboardButton("➕ Add Channel", callback_data="add_channel")],
-              [InlineKeyboardButton("🚪 Logout", callback_data="logout")]]
+        kb = [
+            [InlineKeyboardButton("📢 Broadcast (Post to All)", callback_data="broadcast_start")],
+            [InlineKeyboardButton("📢 My Channels", callback_data="list_channels"), InlineKeyboardButton("➕ Add Channel", callback_data="add_channel")],
+            [InlineKeyboardButton("🚪 Logout", callback_data="logout")]
+        ]
         sent = await m.reply("👋 **Manager Dashboard**\n\nWelcome back, Admin.", reply_markup=InlineKeyboardMarkup(kb))
         user_state[uid]["menu_msg_id"] = sent.id
     else:
@@ -655,7 +658,7 @@ async def handle_inputs(c, m):
 # --- UI MENUS ---
 async def show_main_menu(m, uid, force_new=False):
     kb = [
-        [InlineKeyboardButton("📢 Broadcast (Post to All)", callback_data="broadcast_start")], 
+        [InlineKeyboardButton("📢 Broadcast (Post to All)", callback_data="broadcast_start")],
         [InlineKeyboardButton("📢 My Channels", callback_data="list_channels"), InlineKeyboardButton("➕ Add Channel", callback_data="add_channel")],
         [InlineKeyboardButton("🚪 Logout", callback_data="logout")]
     ]
