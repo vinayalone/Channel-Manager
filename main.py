@@ -869,7 +869,8 @@ async def create_task_logic(uid, q):
                  f"📢 **Channels:** `{len(targets)}`\n"
                  f"📬 **Posts per Channel:** `{len(queue)}`\n"
                  f"🔢 **Total Tasks:** `{total_tasks}`\n"
-                 f"📅 **Start Time:** `{t_str}`")
+                 f"📅 **Start Time:** `{t_str}`\n\n"
+                 f"👉 Click /manage to schedule more.")
 
     await update_menu(q.message, final_txt, None, uid, force_new=False)
 
