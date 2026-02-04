@@ -435,6 +435,44 @@ async def callback_router(c, q):
         user_state[uid]["interval"] = interval
         await ask_settings(q.message, uid)
 
+    # --- PER-POST SETTINGS HANDLER ---
+    elif d.startswith("cfg_q_"):
+        idx = int(d.split("cfg_q_")[1])
+        post = user_state[uid]["broadcast_queue"][idx]
+        
+        # Display current state
+        p_stat = "Enabled ✅" if post["pin"] else "Disabled ❌"
+        d_stat = "Enabled ✅" if post["delete_old"] else "Disabled ❌"
+        
+        txt = (f"⚙️ **Configuring Post #{idx+1}**\n\n"
+               f"📂 Type: **{post['content_type']}**\n"
+               f"📌 Pin this post? **{p_stat}**\n"
+               f"🗑 Delete previous? **{d_stat}**")
+               
+        kb = [
+            [InlineKeyboardButton(f"📌 Toggle Pin", callback_data=f"t_q_pin_{idx}")],
+            [InlineKeyboardButton(f"🗑 Toggle Delete", callback_data=f"t_q_del_{idx}")],
+            [InlineKeyboardButton("🔙 Back to List", callback_data="step_settings")]
+        ]
+        await update_menu(q.message, txt, kb, uid)
+
+    elif d.startswith("t_q_"):
+        # Format: t_q_pin_0 (action_index)
+        parts = d.split("_")
+        action = parts[2] # "pin" or "del"
+        idx = int(parts[3])
+        
+        post = user_state[uid]["broadcast_queue"][idx]
+        
+        # Toggle Logic
+        if action == "pin": post["pin"] = not post["pin"]
+        if action == "del": post["delete_old"] = not post["delete_old"]
+        
+        # Re-open the specific menu to show update
+        # (We basically redirect to 'cfg_q_IDX')
+        q.data = f"cfg_q_{idx}"
+        await callback_router(c, q)
+
     # --- SETTINGS ---
     elif d in ["toggle_pin", "toggle_del"]:
         st = user_state[uid]
@@ -575,11 +613,15 @@ async def handle_inputs(c, m):
             return
 
         # Add to Queue
+        # Add to Queue
         post_data = {
             "content_type": content_type,
             "content_text": content_text,
             "file_id": file_id,
-            "entities": entities_json
+            "entities": entities_json,
+            # 👇 NEW: Add defaults here
+            "pin": True,
+            "delete_old": True
         }
         st.setdefault("broadcast_queue", []).append(post_data)
         
@@ -711,6 +753,31 @@ async def ask_repetition(m, uid, force_new=False):
 
 async def ask_settings(m, uid, force_new=False):
     st = user_state[uid]
+    queue = st.get("broadcast_queue")
+
+    # --- CASE 1: BATCH MODE (Per-Post Settings) ---
+    if queue:
+        txt = "4️⃣ **Configure Batch Settings**\n\n👇 Click a post below to change its specific Pin/Delete settings:"
+        kb = []
+        icons = {"text": "📝", "photo": "📷", "video": "📹", "audio": "🎵", "poll": "📊"}
+        
+        for i, post in enumerate(queue):
+            # Show status in the button label
+            p_icon = "📌✅" if post["pin"] else "📌❌"
+            d_icon = "🗑✅" if post["delete_old"] else "🗑❌"
+            type_icon = icons.get(post["content_type"], "📁")
+            
+            # Button format: "1. 📷 | 📌✅ 🗑❌"
+            btn_txt = f"{i+1}. {type_icon} | {p_icon} {d_icon}"
+            kb.append([InlineKeyboardButton(btn_txt, callback_data=f"cfg_q_{i}")])
+        
+        kb.append([InlineKeyboardButton("➡️ Confirm All", callback_data="goto_confirm")])
+        kb.append([InlineKeyboardButton("🔙 Back", callback_data="step_rep")])
+        
+        await update_menu(m, txt, kb, uid, force_new)
+        return
+
+    # --- CASE 2: SINGLE POST MODE (Global Settings) ---
     st.setdefault("pin", True)
     st.setdefault("del", True)
     
@@ -724,35 +791,37 @@ async def ask_settings(m, uid, force_new=False):
         [InlineKeyboardButton("🔙 Back", callback_data="step_rep")]
     ]
     await update_menu(m, "4️⃣ **Settings**", kb, uid, force_new)
-
+    
 async def confirm_task(m, uid, force_new=False):
     st = user_state[uid]
     t_str = st["start_time"].strftime("%d-%b %I:%M %p")
     r_str = st["interval"] if st["interval"] else "Once"
     
-    # 👇 FIX: Check for Multi-Post Queue first
     queue = st.get("broadcast_queue")
     
     if queue:
-        # If queue exists, show batch info
+        # BATCH SUMMARY
         type_str = f"📦 Batch ({len(queue)} Posts)"
-        preview_text = "Multi-post content hidden."
+        # Calculate how many are pinned
+        pin_count = sum(1 for p in queue if p['pin'])
+        settings_str = f"📌 Pinning: {pin_count}/{len(queue)} Posts"
     else:
-        # Standard Single Post Logic
+        # SINGLE SUMMARY
         type_map = {
             "text": "📝 Text", "photo": "📷 Photo", "video": "📹 Video",
             "audio": "🎵 Audio", "voice": "🎙 Voice", "document": "📁 File",
             "poll": "📊 Poll", "animation": "🎞 GIF", "sticker": "✨ Sticker"
         }
-        # Fallback to avoid crash if key is missing
         c_type = st.get('content_type', 'unknown')
         type_str = type_map.get(c_type, c_type.upper())
+        
+        settings_str = f"📌 Pin: {'✅' if st.get('pin',True) else '❌'} | 🗑 Del: {'✅' if st.get('del',True) else '❌'}"
     
     txt = (f"✅ **Summary**\n\n"
            f"📢 Content: {type_str}\n"
            f"📅 Time: `{t_str}`\n"
            f"🔁 Repeat: `{r_str}`\n"
-           f"📌 Pin: {'✅' if st['pin'] else '❌'} | 🗑 Del: {'✅' if st['del'] else '❌'}")
+           f"{settings_str}")
     
     kb = [[InlineKeyboardButton("✅ Schedule It", callback_data="save_task")],
           [InlineKeyboardButton("🔙 Back", callback_data="step_settings")]]
@@ -847,8 +916,8 @@ async def create_task_logic(uid, q):
                 "content_text": post["content_text"],
                 "file_id": post["file_id"],
                 "entities": post["entities"],
-                "pin": st["pin"],
-                "delete_old": st["del"],
+                "pin": post.get("pin", st.get("pin", True)),
+                "delete_old": post.get("delete_old", st.get("del", True)),
                 "repeat_interval": st["interval"],
                 "start_time": run_time.isoformat(),
                 "last_msg_id": None
