@@ -1097,7 +1097,7 @@ def add_scheduler_job(tid, t):
                     
                     # --- B. TEXT ---
                     elif t["content_type"] == "text":
-                        sent = await user.send_message(target, caption, entities=entities_objs, reply_to_message_id=reply_id)
+                        sent = await user.send_message(target, caption, entities=entities_objs, reply_to_message_id=reply_id, disable_web_page_preview=True)
                     
                     # --- C. MEDIA (Photo, Video, Animation, Document) ---
                     # Strategy: Try File ID first (Fast). If fails, Download & Upload (Reliable).
