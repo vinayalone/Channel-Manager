@@ -727,12 +727,23 @@ async def confirm_task(m, uid, force_new=False):
     t_str = st["start_time"].strftime("%d-%b %I:%M %p")
     r_str = st["interval"] if st["interval"] else "Once"
     
-    type_map = {
-        "text": "📝 Text", "photo": "📷 Photo", "video": "📹 Video",
-        "audio": "🎵 Audio", "voice": "🎙 Voice", "document": "📁 File",
-        "poll": "📊 Poll", "animation": "🎞 GIF", "sticker": "✨ Sticker"
-    }
-    type_str = type_map.get(st['content_type'], st['content_type'].upper())
+    # 👇 FIX: Check for Multi-Post Queue first
+    queue = st.get("broadcast_queue")
+    
+    if queue:
+        # If queue exists, show batch info
+        type_str = f"📦 Batch ({len(queue)} Posts)"
+        preview_text = "Multi-post content hidden."
+    else:
+        # Standard Single Post Logic
+        type_map = {
+            "text": "📝 Text", "photo": "📷 Photo", "video": "📹 Video",
+            "audio": "🎵 Audio", "voice": "🎙 Voice", "document": "📁 File",
+            "poll": "📊 Poll", "animation": "🎞 GIF", "sticker": "✨ Sticker"
+        }
+        # Fallback to avoid crash if key is missing
+        c_type = st.get('content_type', 'unknown')
+        type_str = type_map.get(c_type, c_type.upper())
     
     txt = (f"✅ **Summary**\n\n"
            f"📢 Content: {type_str}\n"
