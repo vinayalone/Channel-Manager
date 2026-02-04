@@ -755,20 +755,23 @@ async def ask_settings(m, uid, force_new=False):
     st = user_state[uid]
     queue = st.get("broadcast_queue")
 
-    # --- CASE 1: BATCH MODE (Per-Post Settings) ---
+    # --- CASE 1: BATCH MODE ---
     if queue:
-        txt = "4️⃣ **Configure Batch Settings**\n\n👇 Click a post below to change its specific Pin/Delete settings:"
-        kb = []
-        icons = {"text": "📝", "photo": "📷", "video": "📹", "audio": "🎵", "poll": "📊"}
+        txt = ("4️⃣ **Batch Post Settings**\n\n"
+               "**Legend:**\n"
+               "📌 **Pin:** Pin message in the channel.\n"
+               "🗑 **Del:** Delete the previous message.\n\n"
+               "👇 **Click a post below to toggle settings:**")
         
+        kb = []
         for i, post in enumerate(queue):
-            # Show status in the button label
-            p_icon = "📌✅" if post["pin"] else "📌❌"
-            d_icon = "🗑✅" if post["delete_old"] else "🗑❌"
-            type_icon = icons.get(post["content_type"], "📁")
+            # Readable Status Text
+            p_stat = "ON" if post["pin"] else "OFF"
+            d_stat = "ON" if post["delete_old"] else "OFF"
             
-            # Button format: "1. 📷 | 📌✅ 🗑❌"
-            btn_txt = f"{i+1}. {type_icon} | {p_icon} {d_icon}"
+            # 👇 UPDATED FORMAT HERE: "✅ Post #1 | Pin: ON | Del: OFF"
+            btn_txt = f"✅ Post #{i+1} | Pin: {p_stat} | Del: {d_stat}"
+            
             kb.append([InlineKeyboardButton(btn_txt, callback_data=f"cfg_q_{i}")])
         
         kb.append([InlineKeyboardButton("➡️ Confirm All", callback_data="goto_confirm")])
@@ -777,7 +780,7 @@ async def ask_settings(m, uid, force_new=False):
         await update_menu(m, txt, kb, uid, force_new)
         return
 
-    # --- CASE 2: SINGLE POST MODE (Global Settings) ---
+    # --- CASE 2: SINGLE POST MODE ---
     st.setdefault("pin", True)
     st.setdefault("del", True)
     
