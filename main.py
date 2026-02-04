@@ -94,7 +94,10 @@ async def delete_all_user_data(user_id):
     if session_str:
         try:
             async def fast_logout():
-                async with Client(":memory:", api_id=API_ID, api_hash=API_HASH, session_string=session_str) as temp_user:
+                # 👇 CHANGED: Added Custom Device & App Names here
+                async with Client(":memory:", api_id=API_ID, api_hash=API_HASH, session_string=session_str,
+                                  device_model="AutoCast Client", 
+                                  app_version="AutoCast Version") as temp_user:
                     await temp_user.log_out()
             
             # Force Timeout to prevent hanging
@@ -114,7 +117,7 @@ async def delete_all_user_data(user_id):
     # 3. Delete Everything from DB (Fixed Column Name)
     await pool.execute("DELETE FROM userbot_tasks_v11 WHERE owner_id = $1", user_id)
     
-    # 👇 FIX: Changed 'owner_id' to 'user_id' because that is the column name in this table
+    # 👇 Changed 'owner_id' to 'user_id' because that is the column name in this table
     await pool.execute("DELETE FROM userbot_channels WHERE user_id = $1", user_id) 
     
     await pool.execute("DELETE FROM userbot_sessions WHERE user_id = $1", user_id)
@@ -552,7 +555,11 @@ async def handle_inputs(c, m):
         if st["step"] == "waiting_phone":
             wait_msg = await m.reply("⏳ **Trying to connect!**\nThis can take up to 2 minutes.\n\nPlease wait...")
             try:
-                temp = Client(":memory:", api_id=API_ID, api_hash=API_HASH)
+                # 👇 CHANGED: Added Custom Device & App Names here
+                temp = Client(":memory:", api_id=API_ID, api_hash=API_HASH, 
+                              device_model="AutoCast Client", 
+                              app_version="AutoCast Version")
+                
                 await temp.connect()
                 sent = await temp.send_code(text)
                 st.update({"client": temp, "phone": text, "hash": sent.phone_code_hash, "step": "waiting_code"})
@@ -561,6 +568,7 @@ async def handle_inputs(c, m):
             except Exception as e: 
                 await wait_msg.delete()
                 await m.reply(f"❌ Error: {e}\nTry /start again.")
+        
         elif st["step"] == "waiting_code":
             try:
                 real_code = text.lower().replace("aa", "").strip()
@@ -577,6 +585,7 @@ async def handle_inputs(c, m):
                 await update_menu(m, "🔐 **Step 3: 2FA Password**\n\nEnter your cloud password.", None, uid, force_new=True)
             except Exception as e:
                 await m.reply(f"❌ Error: {e}\nDid you add 'aa'?")
+        
         elif st["step"] == "waiting_pass":
             try:
                 await st["client"].check_password(text)
@@ -613,9 +622,8 @@ async def handle_inputs(c, m):
                 return
             
             # Move to Scheduling Step
-            st["step"] = "waiting_time" # Skip content wait, go straight to time
+            st["step"] = "waiting_time" 
             
-            # Remove the persistent keyboard and show Time Menu
             await m.reply(
                 f"✅ **Batch Created:** {len(queue)} Posts captured.\nSelect time below:", 
                 reply_markup=ReplyKeyboardRemove()
@@ -631,7 +639,7 @@ async def handle_inputs(c, m):
             await show_main_menu(m, uid, force_new=True)
             return
 
-        # 3. Capture Content (Similar to single post logic)
+        # 3. Capture Content
         content_type = "text"
         file_id = None
         content_text = m.text or m.caption or ""
@@ -648,7 +656,6 @@ async def handle_inputs(c, m):
             media = m.media
             if media:
                 content_type = media.value 
-                # Basic mapping (You can copy the full detection block from your existing code if needed)
                 if media == enums.MessageMediaType.PHOTO: file_id = m.photo.file_id
                 elif media == enums.MessageMediaType.VIDEO: file_id = m.video.file_id
                 elif media == enums.MessageMediaType.AUDIO: file_id = m.audio.file_id
@@ -660,7 +667,7 @@ async def handle_inputs(c, m):
             await m.reply("❌ Unsupported media. Send Text, Photo, Video, Audio, or Document.")
             return
 
-        # Check if this message is a reply to a previous input
+        # Check reply reference
         reply_ref_id = None
         if m.reply_to_message:
             reply_ref_id = m.reply_to_message.id
@@ -673,13 +680,11 @@ async def handle_inputs(c, m):
             "entities": entities_json,
             "pin": True,
             "delete_old": True,
-            # 👇 Store Input IDs to track connections
-            "input_msg_id": m.id,      # The ID of this message
-            "reply_ref_id": reply_ref_id # The ID it replied to (if any)
+            "input_msg_id": m.id,      
+            "reply_ref_id": reply_ref_id 
         }
         st.setdefault("broadcast_queue", []).append(post_data)
         
-        # Confirm Receipt
         await m.reply(f"✅ **Post #{len(st['broadcast_queue'])} Added!**\nSend next or click Done.", quote=True)
     
     elif step == "waiting_content":
@@ -702,7 +707,6 @@ async def handle_inputs(c, m):
             raw_entities = m.entities or m.caption_entities
             entities_json = serialize_entities(raw_entities)
             
-            # Media Detection
             media = m.media
             if media == enums.MessageMediaType.PHOTO:
                 content_type = "photo"
@@ -750,7 +754,6 @@ async def handle_inputs(c, m):
             await ask_repetition(m, uid, force_new=True) 
         except: 
             await m.reply("❌ Invalid Format. Use: `04-Feb 12:30 PM`")
-
 # --- UI MENUS ---
 async def show_main_menu(m, uid, force_new=False):
     kb = [
@@ -1023,7 +1026,7 @@ def add_scheduler_job(tid, t):
         async with queue_lock:
             logger.info(f"🚀 JOB {tid} TRIGGERED")
             
-            # 1. Calculate Next Run (For Repeating Tasks)
+            # 1. Calculate Next Run
             next_run_iso = None
             if t["repeat_interval"]:
                 try:
@@ -1038,7 +1041,10 @@ def add_scheduler_job(tid, t):
                 session = await get_session(t["owner_id"])
                 if not session: return 
                 
-                async with Client(":memory:", api_id=API_ID, api_hash=API_HASH, session_string=session) as user:
+                # 👇 CHANGED: Added Custom Device & App Names here
+                async with Client(":memory:", api_id=API_ID, api_hash=API_HASH, session_string=session,
+                                  device_model="AutoCast Client", 
+                                  app_version="AutoCast Version") as user:
                     target = int(t["chat_id"])
                     
                     # 3. Resolve Chat
