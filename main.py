@@ -70,6 +70,20 @@ async def add_channel(user_id, cid, title):
     pool = await get_db()
     await pool.execute("INSERT INTO userbot_channels (user_id, channel_id, title) VALUES ($1, $2, $3) ON CONFLICT (user_id, channel_id) DO UPDATE SET title = $3", user_id, cid, title)
 
+async def delete_all_user_data(user_id):
+    pool = await get_db()
+    # 1. Stop scheduler jobs
+    tasks = await pool.fetch("SELECT task_id FROM userbot_tasks_v11 WHERE owner_id = $1", user_id)
+    if scheduler:
+        for t in tasks:
+            try: scheduler.remove_job(t['task_id'])
+            except: pass
+            
+    # 2. Delete Everything
+    await pool.execute("DELETE FROM userbot_tasks_v11 WHERE owner_id = $1", user_id)
+    await pool.execute("DELETE FROM userbot_channels WHERE owner_id = $1", user_id) # Optional: remove channels too
+    await pool.execute("DELETE FROM userbot_sessions WHERE user_id = $1", user_id)
+
 async def get_channels(user_id):
     pool = await get_db()
     return await pool.fetch("SELECT * FROM userbot_channels WHERE user_id = $1", user_id)
@@ -219,9 +233,39 @@ async def callback_router(c, q):
         login_state[uid] = {"step": "waiting_phone"}
         await update_menu(q.message, "📱 **Step 1: Phone Number**\n\nPlease enter your Telegram phone number with country code.\n\nExample: `+919876543210`", [[InlineKeyboardButton("🔙 Cancel", callback_data="menu_home")]], uid)
     
+    # --- 3-STEP SECURE LOGOUT ---
+
+    # Step 1: First Warning
     elif d == "logout":
-        await del_session(uid)
-        await update_menu(q.message, "👋 **Logged out.**\n\nUse /start to login again.", None, uid)
+        # Check how many tasks they have for the warning
+        tasks = await get_all_tasks() # Note: Better to filter by user in DB, but this works for simple count
+        user_tasks = [t for t in tasks if t['owner_id'] == uid]
+        
+        txt = (f"⚠️ **Wait! Are you sure?**\n\n"
+               f"You have **{len(user_tasks)} active tasks** scheduled.\n"
+               f"If you logout, the bot will stop working.")
+        
+        kb = [[InlineKeyboardButton("⚠️ Yes, I want to Logout", callback_data="logout_step_2")],
+              [InlineKeyboardButton("🔙 No, Cancel", callback_data="menu_home")]]
+        
+        await update_menu(q.message, txt, kb, uid)
+
+    # Step 2: Final "Danger" Warning
+    elif d == "logout_step_2":
+        txt = ("🛑 **FINAL WARNING** 🛑\n\n"
+               "This will **PERMANENTLY DELETE** all your scheduled posts and settings.\n"
+               "This action cannot be undone.\n\n"
+               "Are you absolutely sure?")
+        
+        kb = [[InlineKeyboardButton("🗑️ Delete Everything & Logout", callback_data="logout_final")],
+              [InlineKeyboardButton("🔙 No! Go Back", callback_data="menu_home")]]
+        
+        await update_menu(q.message, txt, kb, uid)
+
+    # Step 3: Execution
+    elif d == "logout_final":
+        await delete_all_user_data(uid) # Calls the new helper
+        await update_menu(q.message, "👋 **Logged out successfully.**\n\nAll data has been wiped.", None, uid)
 
     # --- TASK ACTIONS (PRO UI) ---
     elif d.startswith("view_"):
