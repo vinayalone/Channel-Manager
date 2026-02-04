@@ -822,7 +822,7 @@ async def create_task_logic(uid, q):
             # Unique ID: task_TIMESTAMP_CHANNEL_POST
             tid = f"task_{base_tid}_{ch_idx}_{post_idx}"
             
-            # Calculate Time Offset (Optional: Add 2 seconds between posts to keep order)
+            # Calculate Time Offset (Add 2 seconds between posts to keep order)
             run_time = st["start_time"] + datetime.timedelta(seconds=post_idx * 2)
             
             task_data = {
@@ -858,9 +858,6 @@ async def create_task_logic(uid, q):
                  f"📅 **Start Time:** `{t_str}`")
 
     await update_menu(q.message, final_txt, None, uid, force_new=False)
-    except Exception as e:
-        logger.error(f"Save Error: {e}")
-        await q.message.edit_text(f"❌ Error: {e}")
 
 def add_scheduler_job(tid, t):
     if scheduler is None: return
