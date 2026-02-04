@@ -7,11 +7,15 @@ import asyncpg
 import json
 from io import BytesIO
 from pyrogram import Client, filters, idle, errors, enums
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, MessageEntity
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.executors.asyncio import AsyncIOExecutor
+from pyrogram.types import (
+    InlineKeyboardMarkup, InlineKeyboardButton, 
+    Message, MessageEntity,
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+)
 
 # --- CONFIGURATION ---
 API_ID = int(os.environ.get("API_ID"))
@@ -296,6 +300,71 @@ async def callback_router(c, q):
         cid = d.split("back_list_")[1]
         await list_active_tasks(uid, q.message, cid, force_new=False)
 
+    # --- BROADCAST MODE ---
+    elif d == "broadcast_start":
+        # Initialize empty target list
+        user_state[uid]["broadcast_targets"] = []
+        user_state[uid]["step"] = "broadcast_select"
+        await show_broadcast_selection(uid, q.message)
+
+    elif d.startswith("toggle_bc_"):
+        cid = d.split("toggle_bc_")[1]
+        targets = user_state[uid].get("broadcast_targets", [])
+        
+        if cid in targets: targets.remove(cid) # Deselect
+        else: targets.append(cid) # Select
+        
+        user_state[uid]["broadcast_targets"] = targets
+        await show_broadcast_selection(uid, q.message) # Refresh menu to show ✅
+
+    elif d == "broadcast_confirm":
+        targets = user_state[uid].get("broadcast_targets", [])
+        if not targets:
+            await q.answer("❌ Select at least one channel!", show_alert=True)
+            return
+        
+        # Initialize the Queue
+        user_state[uid]["broadcast_queue"] = [] 
+        user_state[uid]["step"] = "waiting_broadcast_content"
+        
+        # Show Persistent "DONE" Button
+        markup = ReplyKeyboardMarkup(
+            [[KeyboardButton("✅ Done Adding Posts")], [KeyboardButton("❌ Cancel")]],
+            resize_keyboard=True,
+            one_time_keyboard=True
+        )
+        
+        await app.send_message(
+            q.message.chat.id, 
+            f"📢 **Multi-Post Mode Active**\n\n"
+            f"You have selected **{len(targets)} channels**.\n"
+            f"👇 **Instructions:**\n"
+            f"1. Send your posts one by one (Text, Photo, Video, etc).\n"
+            f"2. When finished, click the **✅ Done Adding Posts** button below.",
+            reply_markup=markup
+        )
+
+    async def show_broadcast_selection(uid, m):
+    chs = await get_channels(uid)
+    if not chs:
+        await update_menu(m, "❌ No channels found.", [[InlineKeyboardButton("🔙 Back", callback_data="menu_home")]], uid)
+        return
+
+    targets = user_state[uid].get("broadcast_targets", [])
+    kb = []
+    
+    # Create Toggle Buttons
+    for c in chs:
+        is_selected = c['channel_id'] in targets
+        icon = "✅" if is_selected else "⬜"
+        kb.append([InlineKeyboardButton(f"{icon} {c['title']}", callback_data=f"toggle_bc_{c['channel_id']}")])
+    
+    # Done Button
+    kb.append([InlineKeyboardButton(f"➡️ Done ({len(targets)} Selected)", callback_data="broadcast_confirm")])
+    kb.append([InlineKeyboardButton("🔙 Cancel", callback_data="menu_home")])
+    
+    await update_menu(m, "📢 **Broadcast Mode**\n\nSelect channels to post to:", kb, uid)
+
     # --- CHANNEL MANAGEMENT ---
     elif d == "list_channels":
         await show_channels(uid, q.message)
@@ -447,6 +516,75 @@ async def handle_inputs(c, m):
         else: 
             await m.reply("❌ Invalid Forward. Try again.")
 
+    # --- MULTI-POST BROADCAST LOGIC ---
+    elif step == "waiting_broadcast_content":
+        # 1. Handle "Done" Button
+        if text == "✅ Done Adding Posts":
+            queue = st.get("broadcast_queue", [])
+            if not queue:
+                await m.reply("❌ You haven't added any posts yet!", quote=True)
+                return
+            
+            # Move to Scheduling Step
+            st["step"] = "waiting_time" # Skip content wait, go straight to time
+            
+            # Remove the persistent keyboard and show Time Menu
+            await m.reply(
+                f"✅ **Batch Created:** {len(queue)} Posts captured.\nSelect time below:", 
+                reply_markup=ReplyKeyboardRemove()
+            )
+            await show_time_menu(m, uid, force_new=True)
+            return
+
+        # 2. Handle "Cancel"
+        if text == "❌ Cancel":
+            user_state[uid]["step"] = None
+            if "broadcast_queue" in user_state[uid]: del user_state[uid]["broadcast_queue"]
+            await m.reply("🚫 Broadcast Cancelled.", reply_markup=ReplyKeyboardRemove())
+            await show_main_menu(m, uid, force_new=True)
+            return
+
+        # 3. Capture Content (Similar to single post logic)
+        content_type = "text"
+        file_id = None
+        content_text = m.text or m.caption or ""
+        entities_json = None
+        
+        if m.poll:
+            content_type = "poll"
+            content_text = m.poll.question
+            poll_data = { "options": [o.text for o in m.poll.options], "is_anonymous": m.poll.is_anonymous, "allows_multiple_answers": m.poll.allows_multiple_answers, "type": str(m.poll.type) }
+            entities_json = json.dumps(poll_data)
+        else:
+            raw_entities = m.entities or m.caption_entities
+            entities_json = serialize_entities(raw_entities)
+            media = m.media
+            if media:
+                content_type = media.value 
+                # Basic mapping (You can copy the full detection block from your existing code if needed)
+                if media == enums.MessageMediaType.PHOTO: file_id = m.photo.file_id
+                elif media == enums.MessageMediaType.VIDEO: file_id = m.video.file_id
+                elif media == enums.MessageMediaType.AUDIO: file_id = m.audio.file_id
+                elif media == enums.MessageMediaType.VOICE: file_id = m.voice.file_id
+                elif media == enums.MessageMediaType.DOCUMENT: file_id = m.document.file_id
+                elif media == enums.MessageMediaType.ANIMATION: file_id = m.animation.file_id
+        
+        if content_type != "text" and not file_id and content_type != "poll":
+            await m.reply("❌ Unsupported media. Send Text, Photo, Video, Audio, or Document.")
+            return
+
+        # Add to Queue
+        post_data = {
+            "content_type": content_type,
+            "content_text": content_text,
+            "file_id": file_id,
+            "entities": entities_json
+        }
+        st.setdefault("broadcast_queue", []).append(post_data)
+        
+        # Confirm Receipt
+        await m.reply(f"✅ **Post #{len(st['broadcast_queue'])} Added!**\nSend next or click Done.", quote=True)
+    
     elif step == "waiting_content":
         content_type = "text"
         file_id = None
@@ -517,10 +655,12 @@ async def handle_inputs(c, m):
             await m.reply("❌ Invalid Format. Use: `04-Feb 12:30 PM`")
 
 # --- UI MENUS ---
-
 async def show_main_menu(m, uid, force_new=False):
-    kb = [[InlineKeyboardButton("📢 My Channels", callback_data="list_channels"), InlineKeyboardButton("➕ Add Channel", callback_data="add_channel")],
-          [InlineKeyboardButton("🚪 Logout", callback_data="logout")]]
+    kb = [
+        [InlineKeyboardButton("📢 Broadcast (Post to All)", callback_data="broadcast_start")], 
+        [InlineKeyboardButton("📢 My Channels", callback_data="list_channels"), InlineKeyboardButton("➕ Add Channel", callback_data="add_channel")],
+        [InlineKeyboardButton("🚪 Logout", callback_data="logout")]
+    ]
     await update_menu(m, "👋 **Manager Dashboard**", kb, uid, force_new)
 
 async def show_channels(uid, m, force_new=False):
@@ -661,43 +801,66 @@ async def show_task_details(uid, m, tid):
 # --- WORKER ---
 async def create_task_logic(uid, q):
     st = user_state[uid]
-    tid = f"task_{int(datetime.datetime.now().timestamp())}"
-    
-    t_str = st["start_time"].strftime("%d-%b %I:%M %p")
-    chs = await get_channels(uid)
-    ch_title = "Channel"
-    for c in chs:
-        if c['channel_id'] == st['target']:
-            ch_title = c['title']
-            break
+    targets = st.get("broadcast_targets", [st.get("target")])
+    queue = st.get("broadcast_queue") # <--- Get the queue
 
-    task_data = {
-        "task_id": tid,
-        "owner_id": uid,
-        "chat_id": st["target"],
-        "content_type": st["content_type"],
-        "content_text": st["content_text"],
-        "file_id": st["file_id"],
-        "entities": st.get("entities"), 
-        "pin": st["pin"],
-        "delete_old": st["del"],
-        "repeat_interval": st["interval"],
-        "start_time": st["start_time"].isoformat(),
-        "last_msg_id": None
-    }
-    
-    try:
-        await save_task(task_data)
-        add_scheduler_job(tid, task_data)
-        
-        final_txt = (f"🎉 **Scheduled Successfully!**\n\n"
-                     f"📢 **Channel:** `{ch_title}`\n"
-                     f"📅 **Time:** `{t_str}`\n"
-                     f"🔁 **Repeat:** `{st['interval'] or 'No'}`\n\n"
-                     f"👉 Click /manage to schedule more.")
-        
-        # ✅ FINAL: Edit the Summary message (force_new=False)
-        await update_menu(q.message, final_txt, None, uid, force_new=False)
+    # If no queue (Single post mode), make a fake queue of 1 item
+    if not queue:
+        queue = [{
+            "content_type": st["content_type"],
+            "content_text": st["content_text"],
+            "file_id": st["file_id"],
+            "entities": st.get("entities")
+        }]
+
+    base_tid = int(datetime.datetime.now().timestamp())
+    t_str = st["start_time"].strftime("%d-%b %I:%M %p")
+    total_tasks = 0
+
+    # Double Loop: For Every Channel -> For Every Post
+    for ch_idx, cid in enumerate(targets):
+        for post_idx, post in enumerate(queue):
+            
+            # Unique ID: task_TIMESTAMP_CHANNEL_POST
+            tid = f"task_{base_tid}_{ch_idx}_{post_idx}"
+            
+            # Calculate Time Offset (Optional: Add 2 seconds between posts to keep order)
+            run_time = st["start_time"] + datetime.timedelta(seconds=post_idx * 2)
+            
+            task_data = {
+                "task_id": tid,
+                "owner_id": uid,
+                "chat_id": cid,
+                "content_type": post["content_type"],
+                "content_text": post["content_text"],
+                "file_id": post["file_id"],
+                "entities": post["entities"],
+                "pin": st["pin"],
+                "delete_old": st["del"],
+                "repeat_interval": st["interval"],
+                "start_time": run_time.isoformat(),
+                "last_msg_id": None
+            }
+            
+            try:
+                await save_task(task_data)
+                add_scheduler_job(tid, task_data)
+                total_tasks += 1
+            except Exception as e:
+                logger.error(f"Task Fail: {e}")
+
+    # Cleanup
+    if "broadcast_targets" in user_state[uid]: del user_state[uid]["broadcast_targets"]
+    if "broadcast_queue" in user_state[uid]: del user_state[uid]["broadcast_queue"]
+
+    final_txt = (f"🎉 **Broadcast Scheduled!**\n\n"
+                 f"📢 **Channels:** `{len(targets)}`\n"
+                 f"📬 **Posts per Channel:** `{len(queue)}`\n"
+                 f"🔢 **Total Tasks:** `{total_tasks}`\n"
+                 f"📅 **Start Time:** `{t_str}`")
+
+    await update_menu(q.message, final_txt, None, uid, force_new=False)
+
     except Exception as e:
         logger.error(f"Save Error: {e}")
         await q.message.edit_text(f"❌ Error: {e}")
