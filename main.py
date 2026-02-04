@@ -526,7 +526,11 @@ async def show_main_menu(m, uid, force_new=False):
 async def show_channels(uid, m, force_new=False):
     chs = await get_channels(uid)
     if not chs:
-        await update_menu(m, "❌ No channels.", [[InlineKeyboardButton("➕ Add One", callback_data="add_channel")]], uid, force_new)
+        kb = [
+            [InlineKeyboardButton("➕ Add One", callback_data="add_channel")],
+            [InlineKeyboardButton("🔙 Back", callback_data="menu_home")]
+        ]
+        await update_menu(m, "❌ No channels.", kb, uid, force_new)
         return
     kb = []
     for c in chs: kb.append([InlineKeyboardButton(c['title'], callback_data=f"ch_{c['channel_id']}")])
