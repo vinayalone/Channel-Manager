@@ -344,28 +344,6 @@ async def callback_router(c, q):
             reply_markup=markup
         )
 
-async def show_broadcast_selection(uid, m):
-    # 👇 These lines MUST have 4 spaces at the start
-    chs = await get_channels(uid)
-    if not chs:
-        await update_menu(m, "❌ No channels found.", [[InlineKeyboardButton("🔙 Back", callback_data="menu_home")]], uid)
-        return
-
-    targets = user_state[uid].get("broadcast_targets", [])
-    kb = []
-    
-    # Create Toggle Buttons
-    for c in chs:
-        is_selected = c['channel_id'] in targets
-        icon = "✅" if is_selected else "⬜"
-        kb.append([InlineKeyboardButton(f"{icon} {c['title']}", callback_data=f"toggle_bc_{c['channel_id']}")])
-    
-    # Done Button
-    kb.append([InlineKeyboardButton(f"➡️ Done ({len(targets)} Selected)", callback_data="broadcast_confirm")])
-    kb.append([InlineKeyboardButton("🔙 Cancel", callback_data="menu_home")])
-    
-    await update_menu(m, "📢 **Broadcast Mode**\n\nSelect channels to post to:", kb, uid)
-
     # --- CHANNEL MANAGEMENT ---
     elif d == "list_channels":
         await show_channels(uid, q.message)
@@ -453,8 +431,28 @@ async def show_broadcast_selection(uid, m):
         cid = d.split("tasks_")[1]
         await list_active_tasks(uid, q.message, cid)
 
-# --- INPUTS ---
+async def show_broadcast_selection(uid, m):
+    chs = await get_channels(uid)
+    if not chs:
+        await update_menu(m, "❌ No channels found.", [[InlineKeyboardButton("🔙 Back", callback_data="menu_home")]], uid)
+        return
 
+    targets = user_state[uid].get("broadcast_targets", [])
+    kb = []
+    
+    # Create Toggle Buttons
+    for c in chs:
+        is_selected = c['channel_id'] in targets
+        icon = "✅" if is_selected else "⬜"
+        kb.append([InlineKeyboardButton(f"{icon} {c['title']}", callback_data=f"toggle_bc_{c['channel_id']}")])
+    
+    # Done Button
+    kb.append([InlineKeyboardButton(f"➡️ Done ({len(targets)} Selected)", callback_data="broadcast_confirm")])
+    kb.append([InlineKeyboardButton("🔙 Cancel", callback_data="menu_home")])
+    
+    await update_menu(m, "📢 **Broadcast Mode**\n\nSelect channels to post to:", kb, uid)
+
+# --- INPUTS ---
 @app.on_message(filters.private & ~filters.command("manage") & ~filters.command("start"))
 async def handle_inputs(c, m):
     uid = m.from_user.id
