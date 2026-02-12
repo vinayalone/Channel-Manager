@@ -560,6 +560,60 @@ async def callback_router(c, q):
         await ask_repetition(q.message, uid)
     elif d == "step_settings":
         await ask_settings(q.message, uid)
+    # --- WIZARD: HANDLE AUTO-DELETE OFFSET ---
+    elif d.startswith("wizard_ask_offset"):
+        # 1. Check if Repetition is enabled (Required for Auto-Delete)
+        interval = user_state[uid].get("interval")
+        if not interval:
+            await q.answer("⚠️ You must set a Repeat Interval first!", show_alert=True)
+            return
+
+        repeat_mins = int(interval.split("=")[1])
+        
+        # 2. Check if this is for a specific post in a Batch (e.g., "wizard_ask_offset_2")
+        parts = d.split("_")
+        is_batch = len(parts) > 3 
+        # ID logic: If batch, ID is "WIZARD_2" (index 2). If single, ID is "WIZARD"
+        temp_task_id = f"WIZARD_{parts[3]}" if is_batch else "WIZARD"
+        
+        # 3. Generate the keyboard
+        # We reuse the existing keyboard builder!
+        markup = await get_delete_before_kb(temp_task_id, repeat_mins)
+        
+        await update_menu(
+            q.message, 
+            f"⏳ **Select Auto-Delete Time**\n\n"
+            f"Repeat Interval: Every {repeat_mins} mins.\n"
+            f"When should this post be deleted?", 
+            markup.inline_keyboard, 
+            uid
+        )
+
+    # --- WIZARD: SAVE THE OFFSET ---
+    elif d.startswith("set_del_off_WIZARD"):
+        # Format can be: 
+        # Single: set_del_off_WIZARD_60
+        # Batch:  set_del_off_WIZARD_2_60
+        
+        parts = d.split("_")
+        
+        if len(parts) == 5:
+            # SINGLE MODE
+            offset = int(parts[4])
+            user_state[uid]["auto_delete_offset"] = offset
+            await q.answer(f"✅ Auto-Delete set to {offset}m!")
+            
+        elif len(parts) == 6:
+            # BATCH MODE
+            idx = int(parts[4])
+            offset = int(parts[5])
+            # Save to the specific post in the queue
+            if "broadcast_queue" in user_state[uid]:
+                user_state[uid]["broadcast_queue"][idx]["auto_delete_offset"] = offset
+            await q.answer(f"✅ Post #{idx+1} auto-delete set to {offset}m!")
+
+        # Return to Settings Menu
+        await ask_settings(q.message, uid)
 
     # --- TIME ---
     elif d.startswith("time_"):
