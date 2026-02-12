@@ -47,16 +47,94 @@ async def get_db():
 async def init_db():
     pool = await get_db()
     async with pool.acquire() as conn:
-        await conn.execute('''CREATE TABLE IF NOT EXISTS userbot_tasks_v11
-                           (task_id TEXT PRIMARY KEY, owner_id BIGINT, chat_id TEXT, 
-                            content_type TEXT, content_text TEXT, file_id TEXT, 
-                            entities TEXT, 
-                            pin BOOLEAN, delete_old BOOLEAN, 
-                            repeat_interval TEXT, start_time TEXT, last_msg_id BIGINT)''')
+        # 1. Create the table with ALL columns included from the start
+        # This is cleaner and faster than creating then altering.
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS userbot_tasks_v11 (
+                task_id TEXT PRIMARY KEY, 
+                owner_id BIGINT, 
+                chat_id TEXT, 
+                content_type TEXT, 
+                content_text TEXT, 
+                file_id TEXT, 
+                entities TEXT, 
+                pin BOOLEAN DEFAULT FALSE, 
+                delete_old BOOLEAN DEFAULT FALSE, 
+                repeat_interval TEXT, 
+                start_time TEXT, 
+                last_msg_id BIGINT,
+                auto_delete_offset INTEGER DEFAULT 0,
+                reply_target TEXT
+            );
+        ''')
         
-        # 👇 NEW: Add 'reply_target' column (Stores the Task ID to reply to)
-        try: await conn.execute("ALTER TABLE userbot_tasks_v11 ADD COLUMN IF NOT EXISTS reply_target TEXT")
-        except: pass
+        # 2. SEAMLESS MIGRATION (The "Self-Healing" logic)
+        # If you ever change the table name or add columns later, 
+        # these 'IF NOT EXISTS' alterations ensure existing DBs don't break.
+        migrations = [
+            "ALTER TABLE userbot_tasks_v11 ADD COLUMN IF NOT EXISTS auto_delete_offset INTEGER DEFAULT 0",
+            "ALTER TABLE userbot_tasks_v11 ADD COLUMN IF NOT EXISTS reply_target TEXT"
+        ]
+        
+        for query in migrations:
+            try:
+                await conn.execute(query)
+            except Exception as e:
+                logger.warning(f"⚠️ Migration note (likely already exists): {e}")
+
+    logger.info("📡 Database initialized: userbot_tasks_v11 is ready.")
+
+async def migrate_to_v11():
+    pool = await get_db()
+    async with pool.acquire() as conn:
+        logger.info("🔄 [MIGRATION] Checking for legacy data in 'tasks' table...")
+        
+        # Check if the old table exists before trying to move data
+        table_exists = await conn.fetchval("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = 'tasks'
+            );
+        """)
+        
+        if table_exists:
+            try:
+                # This query copies all data and ignores duplicates if you've already run it
+                result = await conn.execute('''
+                    INSERT INTO userbot_tasks_v11 (
+                        task_id, owner_id, chat_id, content_type, content_text, 
+                        file_id, entities, pin, delete_old, repeat_interval, 
+                        start_time, last_msg_id
+                    )
+                    SELECT 
+                        task_id, owner_id, chat_id, content_type, content_text, 
+                        file_id, entities, pin, delete_old, repeat_interval, 
+                        start_time, last_msg_id
+                    FROM tasks
+                    ON CONFLICT (task_id) DO NOTHING;
+                ''')
+                logger.info(f"✅ [MIGRATION] Success: {result}")
+                
+                # OPTIONAL: Rename the old table so we don't try to migrate again
+                # await conn.execute("ALTER TABLE tasks RENAME TO tasks_legacy_backup;")
+                
+            except Exception as e:
+                logger.error(f"❌ [MIGRATION] Failed to move data: {e}")
+        else:
+            logger.info("ℹ️ [MIGRATION] No legacy 'tasks' table found. Skipping.")
+
+async def delete_sent_message(owner_id, chat_id, message_id):
+    """
+    Independent worker to delete a message.
+    Fetches the user's client to ensure it's still connected.
+    """
+    try:
+        client = user_clients.get(owner_id)
+        if client and client.is_connected:
+            await client.delete_messages(chat_id, message_id)
+            logger.info(f"🗑️ Auto-delete success: Msg {message_id} in {chat_id}")
+    except Exception as e:
+        logger.error(f"❌ Auto-delete failed: {e}")
 
 async def save_task(t):
     pool = await get_db()
@@ -176,6 +254,34 @@ async def get_task_last_msg_id(task_id):
 async def update_next_run(task_id, next_time_str):
     pool = await get_db()
     await pool.execute("UPDATE userbot_tasks_v11 SET start_time = $1 WHERE task_id = $2", next_time_str, task_id)
+
+async def get_delete_before_kb(task_id, repeat_mins):
+    """
+    Generates deletion options based on the repetition interval.
+    """
+    # Options in minutes: 1h, 6h, 12h, 1d, 2d, 7d
+    options = [
+        ("1 Hour", 60), ("6 Hours", 360), ("12 Hours", 720), 
+        ("1 Day", 1440), ("2 Days", 2880), ("7 Days", 10080)
+    ]
+    
+    buttons = []
+    row = []
+    
+    for label, mins in options:
+        # Only show options that are shorter than the repetition time
+        if mins < repeat_mins:
+            row.append(InlineKeyboardButton(f"⏳ {label} Before", callback_data=f"set_del_off_{task_id}_{mins}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    
+    if row: buttons.append(row)
+    
+    buttons.append([InlineKeyboardButton("❌ Don't Delete", callback_data=f"set_del_off_{task_id}_0")])
+    buttons.append([InlineKeyboardButton("🔙 Back", callback_data=f"edit_task_{task_id}")])
+    
+    return InlineKeyboardMarkup(buttons)
 
 # --- SERIALIZATION ---
 def serialize_entities(entities_list):
@@ -1147,7 +1253,7 @@ def add_scheduler_job(tid, t):
                     elif t["content_type"] == "sticker":
                         sent = await user.send_sticker(target, t["file_id"], reply_to_message_id=reply_id)
 
-                    # 7. Post-Send Actions
+ # --- 7. Post-Send Actions ---
                     if sent:
                         logger.info(f"✅ Job {tid}: Message Sent! ID: {sent.id}")
                         
@@ -1155,11 +1261,40 @@ def add_scheduler_job(tid, t):
                         if t["pin"]:
                             try: 
                                 pinned = await sent.pin()
-                                if isinstance(pinned, Message): await pinned.delete() # Hide the "Pinned" service message
+                                if isinstance(pinned, Message): await pinned.delete()
                             except: pass
                         
                         # Update DB with new Message ID
                         await update_last_msg(tid, sent.id)
+
+                        # 🚀 NEW: AUTO-DELETE BEFORE NEW POST LOGIC
+                        offset_mins = t.get("auto_delete_offset", 0)
+                        if offset_mins > 0 and t["repeat_interval"]:
+                            try:
+                                # Calculate when the NEXT post will happen
+                                interval_mins = int(t["repeat_interval"].split("=")[1])
+                                
+                                # Deletion Time = (Current Time + Interval) - Offset
+                                # This ensures it deletes exactly X mins before the next one
+                                delay_until_deletion = interval_mins - offset_mins
+                                
+                                if delay_until_deletion > 0:
+                                    run_at = datetime.datetime.now(IST) + datetime.timedelta(minutes=delay_until_deletion)
+                                    
+                                    # Schedule the deletion job
+                                    scheduler.add_job(
+                                        delete_sent_message,
+                                        'date',
+                                        run_date=run_at,
+                                        args=[t['owner_id'], t['chat_id'], sent.id],
+                                        id=f"del_{tid}_{sent.id}", # Unique ID prevents overwriting
+                                        misfire_grace_time=60
+                                    )
+                                    logger.info(f"⏳ Scheduled delete for Job {tid} at {run_at} ({offset_mins}m before next)")
+                                else:
+                                    logger.warning(f"⚠️ Offset {offset_mins}m is >= Interval {interval_mins}m. Skipping auto-delete.")
+                            except Exception as e:
+                                logger.error(f"❌ Deletion Scheduling Error: {e}")
 
                         # Auto-Delete Task from DB if it is NOT repeating
                         if not t["repeat_interval"]:
@@ -1189,8 +1324,13 @@ def add_scheduler_job(tid, t):
 # --- STARTUP ---
 async def main():
     global queue_lock
-    queue_lock = asyncio.Lock() # Init lock
+    queue_lock = asyncio.Lock()
+    
+    # 1. Initialize the new schema
     await init_db()
+    
+    # 2. Run the migration to pull data from the old 'tasks' table
+    await migrate_to_v11()
     
     executors = { 'default': AsyncIOExecutor() }
     global scheduler
