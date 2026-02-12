@@ -610,6 +610,7 @@ async def callback_router(c, q):
         kb = [
             [InlineKeyboardButton(f"📌 Toggle Pin", callback_data=f"t_q_pin_{idx}")],
             [InlineKeyboardButton(f"🗑 Toggle Delete", callback_data=f"t_q_del_{idx}")],
+            [InlineKeyboardButton("⏰ Set Delete Before", callback_data=f"wizard_ask_offset_{idx}")],
             [InlineKeyboardButton("🔙 Back to List", callback_data="step_settings")]
         ]
         await update_menu(q.message, txt, kb, uid)
@@ -925,18 +926,21 @@ async def ask_settings(m, uid, force_new=False):
     if queue:
         txt = ("4️⃣ **Batch Post Settings**\n\n"
                "**Legend:**\n"
-               "📌 **Pin:** Pin message in the channel.\n"
-               "🗑 **Del:** Delete the previous message.\n\n"
-               "👇 **Click a post below to toggle settings:**")
+               "📌 **Pin:** Pin message.\n"
+               "🗑 **Del:** Delete previous post.\n"
+               "⏰ **Off:** Minutes to delete *before* next post.\n\n"
+               "👇 **Configure individual post settings:**")
         
         kb = []
         for i, post in enumerate(queue):
-            # Readable Status Text
-            p_stat = "ON" if post["pin"] else "OFF"
-            d_stat = "ON" if post["delete_old"] else "OFF"
+            p_stat = "ON" if post.get("pin") else "OFF"
+            d_stat = "ON" if post.get("delete_old") else "OFF"
+            # Show the offset in the button label
+            offset = post.get("auto_delete_offset", 0)
+            off_stat = f"{offset}m" if offset > 0 else "OFF"
             
-            # 👇 UPDATED FORMAT HERE: "✅ Post #1 | Pin: ON | Del: OFF"
-            btn_txt = f"✅ Post #{i+1} | Pin: {p_stat} | Del: {d_stat}"
+            # Label format: ✅ Post #1 | P: ON | D: ON | Off: 60m
+            btn_txt = f"✅ Post #{i+1} | P: {p_stat} | D: {d_stat} | ⏰ {off_stat}"
             
             kb.append([InlineKeyboardButton(btn_txt, callback_data=f"cfg_q_{i}")])
         
@@ -949,17 +953,29 @@ async def ask_settings(m, uid, force_new=False):
     # --- CASE 2: SINGLE POST MODE ---
     st.setdefault("pin", True)
     st.setdefault("del", True)
+    # Default offset to 0 if not present
+    offset = st.get("auto_delete_offset", 0)
     
     pin_icon = "✅" if st["pin"] else "❌"
     del_icon = "✅" if st["del"] else "❌"
     
+    # Text for the deletion button
+    off_text = f"⏰ Delete: {offset}m Before Next" if offset > 0 else "⏰ Auto-Delete: OFF"
+    
     kb = [
         [InlineKeyboardButton(f"📌 Pin Msg: {pin_icon}", callback_data="toggle_pin")],
         [InlineKeyboardButton(f"🗑 Del Old: {del_icon}", callback_data="toggle_del")],
+        # 👇 NEW BUTTON FOR SINGLE MODE 👇
+        [InlineKeyboardButton(off_text, callback_data="wizard_ask_offset")],
         [InlineKeyboardButton("➡️ Confirm", callback_data="goto_confirm")],
         [InlineKeyboardButton("🔙 Back", callback_data="step_rep")]
     ]
-    await update_menu(m, "4️⃣ **Settings**", kb, uid, force_new)
+    
+    msg_text = (f"4️⃣ **Settings**\n\n"
+                f"Configure how your post behaves.\n"
+                f"Auto-delete is currently: **{offset} minutes** before next run.")
+                
+    await update_menu(m, msg_text, kb, uid, force_new)
     
 async def confirm_task(m, uid, force_new=False):
     st = user_state[uid]
@@ -1061,7 +1077,9 @@ async def create_task_logic(uid, q):
             "content_text": st["content_text"],
             "file_id": st["file_id"],
             "entities": st.get("entities"),
-            "input_msg_id": 0, "reply_ref_id": None 
+            "input_msg_id": 0, "reply_ref_id": None,
+            # Ensure single post inherits the offset from the wizard step
+            "auto_delete_offset": st.get("auto_delete_offset", 0) 
         }]
 
     base_tid = int(datetime.datetime.now().timestamp())
@@ -1102,6 +1120,11 @@ async def create_task_logic(uid, q):
                 "entities": post["entities"],
                 "pin": post.get("pin", st.get("pin", True)),
                 "delete_old": post.get("delete_old", st.get("del", True)),
+                
+                # 👇 UPDATED: Save the Auto-Delete Offset
+                # Priorities: 1. Specific Post Setting -> 2. Global Batch Setting -> 3. Default 0
+                "auto_delete_offset": post.get("auto_delete_offset", st.get("auto_delete_offset", 0)),
+                
                 "repeat_interval": st["interval"],
                 "start_time": run_time.isoformat(),
                 "last_msg_id": None,
@@ -1110,7 +1133,8 @@ async def create_task_logic(uid, q):
             
             try:
                 await save_task(task_data)
-                add_scheduler_job(tid, task_data)
+                # Ensure your add_scheduler_job accepts the task_data dict correctly
+                add_scheduler_job(task_data) 
                 total_tasks += 1
             except Exception as e:
                 logger.error(f"Task Fail: {e}")
@@ -1118,6 +1142,8 @@ async def create_task_logic(uid, q):
     # Cleanup
     if "broadcast_targets" in user_state[uid]: del user_state[uid]["broadcast_targets"]
     if "broadcast_queue" in user_state[uid]: del user_state[uid]["broadcast_queue"]
+    # Cleanup the offset from state as well to prevent bleeding into next task
+    if "auto_delete_offset" in user_state[uid]: del user_state[uid]["auto_delete_offset"]
 
     final_txt = (f"🎉 **Broadcast Scheduled!**\n\n"
                  f"📢 **Channels:** `{len(targets)}`\n"
