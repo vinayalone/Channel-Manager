@@ -21,7 +21,7 @@ from pyrogram.types import (
 API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-DATABASE_URL = os.environ.get("DATABASE_URL")
+DATABASE_URL = os.environ.get("DATABASE_URL") 
 
 IST = pytz.timezone('Asia/Kolkata')
 logging.basicConfig(level=logging.INFO)
@@ -803,7 +803,8 @@ async def ask_repetition(m, uid, force_new=False):
         [InlineKeyboardButton("🚫 No Repeat", callback_data="rep_0")],
         [InlineKeyboardButton("🔁 5 Mins", callback_data="rep_5"), InlineKeyboardButton("🔁 30 Mins", callback_data="rep_30")],
         [InlineKeyboardButton("🔁 Hourly", callback_data="rep_60"), InlineKeyboardButton("🔁 6 Hours", callback_data="rep_360")],
-        [InlineKeyboardButton("🔁 Daily", callback_data="rep_1440")],
+        [InlineKeyboardButton("🔁 Daily", callback_data="rep_1440"), InlineKeyboardButton("🔁 2 Days", callback_data="rep_2880")],
+        [InlineKeyboardButton("🔁 7 Days", callback_data="rep_10080")],
         [InlineKeyboardButton("🔙 Back", callback_data="step_time")] 
     ]
     st = user_state[uid]
