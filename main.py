@@ -257,11 +257,13 @@ async def update_next_run(task_id, next_time_str):
 
 async def get_delete_before_kb(task_id, repeat_mins):
     """
-    Generates deletion options based on the repetition interval.
+    Generates deletion options for keeping a post active for a specific 
+    duration AFTER it is sent.
     """
-    # Options in minutes: 1h, 6h, 12h, 1d, 2d, 7d
+    # Options in minutes: 10m, 30m, 1h, 6h, 12h, 1d, 2d, 7d
     options = [
-        ("1 Hour", 60), ("6 Hours", 360), ("12 Hours", 720), 
+        ("10 Mins", 10), ("30 Mins", 30), ("1 Hour", 60), 
+        ("6 Hours", 360), ("12 Hours", 720), 
         ("1 Day", 1440), ("2 Days", 2880), ("7 Days", 10080)
     ]
     
@@ -269,16 +271,18 @@ async def get_delete_before_kb(task_id, repeat_mins):
     row = []
     
     for label, mins in options:
-        # Only show options that are shorter than the repetition time
-        if mins < repeat_mins:
-            row.append(InlineKeyboardButton(f"⏳ {label} Before", callback_data=f"set_del_off_{task_id}_{mins}"))
+        # We removed the 'mins < repeat_mins' check because "Delete After"
+        # can function independently of the repetition interval.
+        row.append(InlineKeyboardButton(f"⏳ {label} After", callback_data=f"set_del_off_{task_id}_{mins}"))
+        
         if len(row) == 2:
             buttons.append(row)
             row = []
     
     if row: buttons.append(row)
     
-    buttons.append([InlineKeyboardButton("❌ Don't Delete", callback_data=f"set_del_off_{task_id}_0")])
+    # Keeping original feature set: Toggle off and Back button
+    buttons.append([InlineKeyboardButton("❌ Don't Auto-Delete", callback_data=f"set_del_off_{task_id}_0")])
     buttons.append([InlineKeyboardButton("🔙 Back", callback_data=f"edit_task_{task_id}")])
     
     return InlineKeyboardMarkup(buttons)
@@ -561,30 +565,32 @@ async def callback_router(c, q):
     elif d == "step_settings":
         await ask_settings(q.message, uid)
     # --- WIZARD: HANDLE AUTO-DELETE OFFSET ---
+    # --- WIZARD: HANDLE AUTO-DELETE OFFSET ---
     elif d.startswith("wizard_ask_offset"):
-        # 1. Check if Repetition is enabled (Required for Auto-Delete)
+        # We no longer strictly require an interval because 
+        # "Delete After" works for one-time posts too.
         interval = user_state[uid].get("interval")
-        if not interval:
-            await q.answer("⚠️ You must set a Repeat Interval first!", show_alert=True)
-            return
-
-        repeat_mins = int(interval.split("=")[1])
         
-        # 2. Check if this is for a specific post in a Batch (e.g., "wizard_ask_offset_2")
+        # Determine repeat_mins for the keyboard builder (default to a high number if no interval)
+        if interval and "=" in interval:
+            repeat_mins = int(interval.split("=")[1])
+        else:
+            repeat_mins = 999999 
+
+        # Check if this is for a specific post in a Batch (e.g., "wizard_ask_offset_2")
         parts = d.split("_")
         is_batch = len(parts) > 3 
-        # ID logic: If batch, ID is "WIZARD_2" (index 2). If single, ID is "WIZARD"
+        
+        # ID logic: If batch, ID is "WIZARD_2" (index 3). If single, ID is "WIZARD"
         temp_task_id = f"WIZARD_{parts[3]}" if is_batch else "WIZARD"
         
-        # 3. Generate the keyboard
-        # We reuse the existing keyboard builder!
+        # Generate the keyboard using the updated "After" logic
         markup = await get_delete_before_kb(temp_task_id, repeat_mins)
         
         await update_menu(
             q.message, 
-            f"⏳ **Select Auto-Delete Time**\n\n"
-            f"Repeat Interval: Every {repeat_mins} mins.\n"
-            f"When should this post be deleted?", 
+            "⏳ **Select Auto-Delete Time**\n\n"
+            "How long should the message stay in the channel **after** being posted before it is automatically deleted?", 
             markup.inline_keyboard, 
             uid
         )
@@ -597,20 +603,22 @@ async def callback_router(c, q):
         
         parts = d.split("_")
         
+        # Logic for Single Mode: set_del_off_WIZARD_{mins}
         if len(parts) == 5:
-            # SINGLE MODE
             offset = int(parts[4])
             user_state[uid]["auto_delete_offset"] = offset
-            await q.answer(f"✅ Auto-Delete set to {offset}m!")
+            time_str = f"{offset}m" if offset > 0 else "Disabled"
+            await q.answer(f"✅ Auto-Delete set to {time_str} after post!")
             
+        # Logic for Batch Mode: set_del_off_WIZARD_{idx}_{mins}
         elif len(parts) == 6:
-            # BATCH MODE
             idx = int(parts[4])
             offset = int(parts[5])
-            # Save to the specific post in the queue
             if "broadcast_queue" in user_state[uid]:
                 user_state[uid]["broadcast_queue"][idx]["auto_delete_offset"] = offset
-            await q.answer(f"✅ Post #{idx+1} auto-delete set to {offset}m!")
+            
+            time_str = f"{offset}m" if offset > 0 else "Disabled"
+            await q.answer(f"✅ Post #{idx+1} auto-delete: {time_str}!")
 
         # Return to Settings Menu
         await ask_settings(q.message, uid)
@@ -1347,32 +1355,24 @@ def add_scheduler_job(tid, t):
                         # Update DB with new Message ID
                         await update_last_msg(tid, sent.id)
 
-                        # 🚀 NEW: AUTO-DELETE BEFORE NEW POST LOGIC
+                        # 🚀 UPDATED: AUTO-DELETE AFTER SEND LOGIC
                         offset_mins = t.get("auto_delete_offset", 0)
-                        if offset_mins > 0 and t["repeat_interval"]:
+                        if offset_mins > 0:
                             try:
-                                # Calculate when the NEXT post will happen
-                                interval_mins = int(t["repeat_interval"].split("=")[1])
+                                # Deletion Time = Current Time + Offset
+                                # This works for BOTH repeating and one-time tasks
+                                run_at = datetime.datetime.now(IST) + datetime.timedelta(minutes=offset_mins)
                                 
-                                # Deletion Time = (Current Time + Interval) - Offset
-                                # This ensures it deletes exactly X mins before the next one
-                                delay_until_deletion = interval_mins - offset_mins
-                                
-                                if delay_until_deletion > 0:
-                                    run_at = datetime.datetime.now(IST) + datetime.timedelta(minutes=delay_until_deletion)
-                                    
-                                    # Schedule the deletion job
-                                    scheduler.add_job(
-                                        delete_sent_message,
-                                        'date',
-                                        run_date=run_at,
-                                        args=[t['owner_id'], t['chat_id'], sent.id],
-                                        id=f"del_{tid}_{sent.id}", # Unique ID prevents overwriting
-                                        misfire_grace_time=60
-                                    )
-                                    logger.info(f"⏳ Scheduled delete for Job {tid} at {run_at} ({offset_mins}m before next)")
-                                else:
-                                    logger.warning(f"⚠️ Offset {offset_mins}m is >= Interval {interval_mins}m. Skipping auto-delete.")
+                                # Schedule the deletion job
+                                scheduler.add_job(
+                                    delete_sent_message,
+                                    'date',
+                                    run_date=run_at,
+                                    args=[t['owner_id'], t['chat_id'], sent.id],
+                                    id=f"del_{tid}_{sent.id}", # Unique ID per message
+                                    misfire_grace_time=60
+                                )
+                                logger.info(f"⏳ Scheduled delete for Job {tid} at {run_at} ({offset_mins}m after sending)")
                             except Exception as e:
                                 logger.error(f"❌ Deletion Scheduling Error: {e}")
 
