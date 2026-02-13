@@ -124,15 +124,23 @@ async def migrate_to_v11():
             logger.info("ℹ️ [MIGRATION] No legacy 'tasks' table found. Skipping.")
 
 async def delete_sent_message(owner_id, chat_id, message_id):
-    """
-    Independent worker to delete a message.
-    Fetches the user's client to ensure it's still connected.
-    """
     try:
-        client = user_clients.get(owner_id)
-        if client and client.is_connected:
-            await client.delete_messages(chat_id, message_id)
+        session = await get_session(owner_id)
+        if not session:
+            return
+
+        async with Client(
+            ":memory:",
+            api_id=API_ID,
+            api_hash=API_HASH,
+            session_string=session,
+            device_model="AutoCast Client",
+            system_version="PC",
+            app_version="AutoCast Version"
+        ) as user:
+            await user.delete_messages(int(chat_id), message_id)
             logger.info(f"🗑️ Auto-delete success: Msg {message_id} in {chat_id}")
+
     except Exception as e:
         logger.error(f"❌ Auto-delete failed: {e}")
 
@@ -1092,6 +1100,9 @@ async def list_active_tasks(uid, m, cid, force_new=False):
         icon = type_icons.get(t['content_type'], "📁")
         try:
             dt = datetime.datetime.fromisoformat(t["start_time"])
+            if dt.tzinfo is None:
+                dt = IST.localize(dt)
+
             time_str = dt.strftime('%I:%M %p') 
         except: time_str = "?"
         
@@ -1108,6 +1119,8 @@ async def show_task_details(uid, m, tid):
         return
 
     dt = datetime.datetime.fromisoformat(t["start_time"])
+    if dt.tzinfo is None:
+        dt = IST.localize(dt)
     time_str = dt.strftime('%d-%b %I:%M %p')
     type_map = {"text": "📝 Text", "photo": "📷 Photo", "video": "📹 Video", "audio": "🎵 Audio", "poll": "📊 Poll"}
     type_str = type_map.get(t['content_type'], "📁 File")
@@ -1216,8 +1229,14 @@ async def create_task_logic(uid, q):
 
     await update_menu(q.message, final_txt, None, uid, force_new=False)
 
-def add_scheduler_job(tid, t):
-    if scheduler is None: return
+def add_scheduler_job(t):
+    if scheduler is None:
+        return
+
+    tid = t["task_id"]
+    dt = datetime.datetime.fromisoformat(t["start_time"])
+    if dt.tzinfo is None:
+        dt = IST.localize(dt)
 
     async def job_func():
         async with queue_lock:
@@ -1227,10 +1246,14 @@ def add_scheduler_job(tid, t):
             next_run_iso = None
             if t["repeat_interval"]:
                 try:
-                    now = datetime.datetime.now(IST)
+                    last_start = datetime.datetime.fromisoformat(t["start_time"])
+                    if last_start.tzinfo is None:
+                        last_start = IST.localize(last_start)
+
                     mins = int(t["repeat_interval"].split("=")[1])
-                    next_run = now + datetime.timedelta(minutes=mins)
+                    next_run = last_start + datetime.timedelta(minutes=mins)
                     next_run_iso = next_run.isoformat()
+
                 except: pass
 
             try:
@@ -1391,15 +1414,38 @@ def add_scheduler_job(tid, t):
                     except: pass
 
     # 8. Setup Scheduler Trigger
-    dt = datetime.datetime.fromisoformat(t["start_time"])
-    trigger = None
     if t["repeat_interval"]:
         mins = int(t["repeat_interval"].split("=")[1])
-        trigger = IntervalTrigger(start_date=dt, timezone=IST, minutes=mins)
+
+        trigger = IntervalTrigger(
+            start_date=dt,
+            timezone=IST,
+            minutes=mins
+        )
+
+        scheduler.add_job(
+            job_func,
+            trigger=trigger,
+            id=tid,
+            replace_existing=True,
+            misfire_grace_time=3600,
+            coalesce=True,
+            max_instances=1
+        )
+
     else:
-        trigger = DateTrigger(run_date=dt, timezone=IST)
-    
-    scheduler.add_job(job_func, trigger, id=tid, replace_existing=True)
+        trigger = DateTrigger(
+            run_date=dt,
+            timezone=IST
+        )
+
+        scheduler.add_job(
+            job_func,
+            trigger=trigger,
+            id=tid,
+            replace_existing=True,
+            misfire_grace_time=3600
+        )
     
 # --- STARTUP ---
 async def main():
@@ -1419,7 +1465,7 @@ async def main():
     try:
         tasks = await get_all_tasks()
         logger.info(f"📂 Loaded {len(tasks)} tasks")
-        for t in tasks: add_scheduler_job(t['task_id'], t)
+        for t in tasks: add_scheduler_job(t)
     except: pass
     await app.start()
     await idle()
