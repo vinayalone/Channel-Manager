@@ -786,6 +786,11 @@ async def handle_inputs(c, m):
         if m.forward_from_chat:
             chat = m.forward_from_chat
             await add_channel(uid, str(chat.id), chat.title)
+            # Force store peer in session
+            session = await get_session(uid)
+            async with Client(":memory:", api_id=API_ID, api_hash=API_HASH, session_string=session) as user:
+                await user.get_chat(chat.id)
+
             user_state[uid]["step"] = None
             await update_menu(m, f"✅ Added **{chat.title}**", [[InlineKeyboardButton("🏠 Menu", callback_data="menu_home")]], uid, force_new=True)
         else: 
@@ -1268,11 +1273,14 @@ def add_scheduler_job(t):
                                   app_version="AutoCast Version") as user:
                     target = int(t["chat_id"])
                     
-                    # 3. Resolve Chat
-                    try: await user.get_chat(target)
-                    except:
-                        async for dialog in user.get_dialogs(limit=200):
-                            if dialog.chat.id == target: break
+                    # 3. Resolve Chat (Stable Version)
+                    try:
+                        await user.resolve_peer(int(target))
+                    except Exception as e:
+                        logger.error(f"❌ Cannot resolve peer {target}: {e}")
+                        return
+
+
                     
                     # 4. Determine Reply Target (Smart Linking)
                     reply_id = None
