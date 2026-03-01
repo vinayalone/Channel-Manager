@@ -95,13 +95,15 @@ def is_spam_message(message) -> bool:
 
 # ================= TOSS FINISH =================
 
-async def trigger_toss_finish(context, channel_id, reply_id):
+async def trigger_toss_finish(context, channel_id, reply_id, original_text):
     try:
         await context.bot.delete_message(chat_id=channel_id, message_id=reply_id)
     except:
         pass
 
-    follow_up = (
+    final_message = (
+        f"<b>{original_text}</b>\n\n"
+        "<b>Loss ❌</b>\n\n"
         "<b>As I Said Toss Normal Limit Se Hi Khelna Hota Hai</b>\n\n"
         "<b>10% Amount Hi Loss Hua Hai Overall Hum Same Limit Se Play Krte He Hai "
         "Toh Profit Me Nikalte He Hai.</b>\n\n"
@@ -110,10 +112,9 @@ async def trigger_toss_finish(context, channel_id, reply_id):
 
     await context.bot.send_message(
         chat_id=channel_id,
-        text=follow_up,
+        text=final_message,
         parse_mode=ParseMode.HTML
     )
-
 # ================= SAFE DELETION CHECK =================
 
 async def check_single_toss(context: ContextTypes.DEFAULT_TYPE):
@@ -121,24 +122,30 @@ async def check_single_toss(context: ContextTypes.DEFAULT_TYPE):
     channel_id = data["channel_id"]
     original_id = data["original_id"]
     reply_id = data["reply_id"]
+    original_text = data["original_text"]
 
     try:
-        # Copy to hidden log group
         temp = await context.bot.copy_message(
             chat_id=LOG_CHAT_ID,
             from_chat_id=channel_id,
             message_id=original_id
         )
 
-        # Delete copy instantly
         await context.bot.delete_message(
             chat_id=LOG_CHAT_ID,
             message_id=temp.message_id
         )
 
+        # Message still exists → do nothing
+
     except BadRequest:
-        # If copy fails → original deleted
-        await trigger_toss_finish(context, channel_id, reply_id)
+        # Message deleted → trigger instantly
+        await trigger_toss_finish(
+            context,
+            channel_id,
+            reply_id,
+            original_text
+        )
 
 # ================= MAIN HANDLER =================
 
@@ -166,11 +173,12 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         context.job_queue.run_once(
             check_single_toss,
-            when=120,
+            when=20,
             data={
                 "channel_id": channel_id,
                 "original_id": msg_id,
-                "reply_id": reply_msg.message_id
+                "reply_id": reply_msg.message_id,
+                "original_text": text
             }
         )
 
