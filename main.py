@@ -3,6 +3,7 @@ import logging
 import sqlite3
 import re
 from telegram import Update
+from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
@@ -19,7 +20,7 @@ if not BOT_TOKEN:
 
 DB_PATH = os.environ.get("DB_PATH", "bot_state.db")
 
-# Existing Blacklist
+# Existing Blacklist Features
 BLACKLIST = [
     "casino", "stakeid", "stake", "bharosa", "punters", "service", 
     "download", "bonus", "right", "circle", "red", "bet", "exclusive", 
@@ -27,20 +28,19 @@ BLACKLIST = [
 ]
 BLACKLIST_REGEX = re.compile(r'\b(?:' + '|'.join(BLACKLIST) + r')\b', re.IGNORECASE)
 
-# New Toss Winner Regex
+# New Toss Winner Pattern
 TOSS_REGEX = re.compile(r'toss winner', re.IGNORECASE)
 
 def init_db():
-    """Initializes the SQLite database with an extra column for Toss tracking."""
+    """Initializes the SQLite database with all tables."""
     logger.info(f"Using database at: {DB_PATH}")
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
-        # Added is_toss column (0 for normal, 1 for toss messages)
+        # Table for existing Poster/Moderation tracking
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS tracked_msgs (
                 channel_id INTEGER,
-                msg_id INTEGER,
-                is_toss INTEGER DEFAULT 0
+                msg_id INTEGER
             )
         """)
         cursor.execute("""
@@ -49,17 +49,25 @@ def init_db():
                 expecting_next BOOLEAN
             )
         """)
+        # New Table for Toss Monitoring
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS toss_tracker (
+                channel_id INTEGER,
+                original_id INTEGER PRIMARY KEY,
+                bot_reply_id INTEGER
+            )
+        """)
         conn.commit()
 
 def has_media_and_link(message) -> bool:
-    """Existing Feature: Checks if the message is a Poster (media + link)."""
+    """Existing Feature: Checks if the message is a Poster (contains media AND a link)."""
     has_media = bool(message.photo or message.video or message.document)
     entities = message.caption_entities if message.caption else message.entities
     has_link = any(ent.type in ['url', 'text_link'] for ent in entities) if entities else False
     return has_media and has_link
 
 def is_spam_message(message) -> bool:
-    """Existing Feature: APK, Audio+Caption, Links, and Blacklist."""
+    """Existing Feature: APKs, Links, Audio+Caption, and Blacklist."""
     entities = message.caption_entities if message.caption else message.entities
     if entities and any(ent.type in ['url', 'text_link'] for ent in entities):
         return True
@@ -73,86 +81,95 @@ def is_spam_message(message) -> bool:
         return True
     return False
 
+async def check_for_deletions(context: ContextTypes.DEFAULT_TYPE):
+    """New Feature: Background Monitor runs every 2 minutes."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT channel_id, original_id, bot_reply_id FROM toss_tracker")
+        active_tosses = cursor.fetchall()
+
+    for channel_id, original_id, bot_reply_id in active_tosses:
+        # Check if message is still there by attempting to delete it
+        # If it fails with 'not found', YOU deleted it. 
+        # If it succeeds, WE just deleted it (counting as 'gone').
+        try:
+            await context.bot.delete_message(chat_id=channel_id, message_id=original_id)
+            await trigger_toss_finish(context, channel_id, original_id, bot_reply_id)
+        except BadRequest as e:
+            if "message to delete not found" in str(e).lower():
+                await trigger_toss_finish(context, channel_id, original_id, bot_reply_id)
+
+async def trigger_toss_finish(context, channel_id, original_id, bot_reply_id):
+    """Deletes the reply and sends the bold follow-up message."""
+    try: 
+        await context.bot.delete_message(chat_id=channel_id, message_id=bot_reply_id)
+    except: 
+        pass
+    
+    follow_up = (
+        "**As I Said Toss Normal Limit Se Hi Khelna Hota Hai \n\n "
+        "10% Amount Hi Loss Hua Hai Overall Hum Same Limit Se Play Krte He Hai Toh Profit Me Nikalte He Hai. \n\n"
+        "Baaki Session Me Cover Krte Hai...❤️**"
+    )
+    await context.bot.send_message(chat_id=channel_id, text=follow_up, parse_mode=ParseMode.MARKDOWN)
+    
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM toss_tracker WHERE original_id = ?", (original_id,))
+
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Main logic: Moderation + Toss Winner handling."""
+    """Main process for all features."""
     message = update.channel_post
     if not message:
         return
 
     channel_id = message.chat_id
     msg_id = message.message_id
-    content_text = message.text or message.caption or ""
+    text = (message.text or message.caption or "")
     
+    # 1. New Feature: Toss Winner Check
+    if TOSS_REGEX.search(text):
+        reply_text = "**Always Play Toss In Small Limits \n\nAgr ID Me 10K Hai Toh Toss 1K Se Khelo Only...👆**"
+        reply_msg = await message.reply_text(reply_text, parse_mode=ParseMode.MARKDOWN)
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("INSERT OR REPLACE INTO toss_tracker VALUES (?, ?, ?)", 
+                         (channel_id, msg_id, reply_msg.message_id))
+        return
+
+    # 2. Existing Feature: Poster/Moderation Logic
     is_poster = has_media_and_link(message)
-    is_toss_msg = bool(TOSS_REGEX.search(content_text))
 
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
-        
-        # --- NEW FEATURE: TOSS WINNER REPLY ---
-        if is_toss_msg:
-            reply_text = "Always Play Toss In Small Limits \n\nAgr ID Me 10K Hai Toh Toss 1K Se Khelo Only...👆"
-            try:
-                reply_msg = await message.reply_text(reply_text)
-                # Track original toss msg and bot's reply as 'is_toss=1'
-                cursor.execute("INSERT INTO tracked_msgs (channel_id, msg_id, is_toss) VALUES (?, ?, 1)", (channel_id, msg_id))
-                cursor.execute("INSERT INTO tracked_msgs (channel_id, msg_id, is_toss) VALUES (?, ?, 1)", (channel_id, reply_msg.message_id))
-                logger.info(f"Toss Winner detected in {channel_id}. Reply sent.")
-            except Exception as e:
-                logger.error(f"Error replying to toss winner: {e}")
-
-        # --- EXISTING FEATURE: NEW POSTER CLEANUP ---
-        elif is_poster:
-            logger.info(f"New Poster detected in {channel_id}. Running cleanup...")
+        if is_poster:
+            cursor.execute("SELECT msg_id FROM tracked_msgs WHERE channel_id = ?", (channel_id,))
+            old_msgs = cursor.fetchall()
+            for (old_msg_id,) in old_msgs:
+                try: await context.bot.delete_message(chat_id=channel_id, message_id=old_msg_id)
+                except: pass
             
-            # Check if any messages we are about to delete were Toss messages
-            cursor.execute("SELECT msg_id, is_toss FROM tracked_msgs WHERE channel_id = ?", (channel_id,))
-            rows = cursor.fetchall()
-            
-            was_toss_involved = any(row[1] == 1 for row in rows)
-
-            for (old_msg_id, _) in rows:
-                try:
-                    await context.bot.delete_message(chat_id=channel_id, message_id=old_msg_id)
-                except BadRequest:
-                    pass
-            
-            # Clear database for this channel
             cursor.execute("DELETE FROM tracked_msgs WHERE channel_id = ?", (channel_id,))
-            
-            # --- NEW FEATURE: SEND FOLLOW-UP IF TOSS WAS DELETED ---
-            if was_toss_involved:
-                follow_up_text = (
-                    "As I Said Toss Normal Limit Se Hi Khelna Hota Hai \n\n "
-                    "10% Amount Hi Loss Hua Hai Overall Hum Same Limit Se Play Krte He Hai Toh Profit Me Nikalte He Hai. \n\n"
-                    "Baaki Session Me Cover Krte Hai...❤️"
-                )
-                await context.bot.send_message(chat_id=channel_id, text=follow_up_text)
-
-            # Track the new poster and set state for the "next" message check
-            cursor.execute("INSERT INTO tracked_msgs (channel_id, msg_id, is_toss) VALUES (?, ?, 0)", (channel_id, msg_id))
+            cursor.execute("INSERT INTO tracked_msgs (channel_id, msg_id) VALUES (?, ?)", (channel_id, msg_id))
             cursor.execute("INSERT OR REPLACE INTO channel_state (channel_id, expecting_next) VALUES (?, 1)", (channel_id,))
-            
         else:
-            # --- EXISTING FEATURE: CHECK MESSAGE BELOW POSTER ---
             cursor.execute("SELECT expecting_next FROM channel_state WHERE channel_id = ?", (channel_id,))
             row = cursor.fetchone()
-            
             if row and row[0] == 1:
                 if is_spam_message(message):
-                    logger.info(f"Subsequent message {msg_id} is spam. Tracking for deletion.")
-                    cursor.execute("INSERT INTO tracked_msgs (channel_id, msg_id, is_toss) VALUES (?, ?, 0)", (channel_id, msg_id))
-                
+                    cursor.execute("INSERT INTO tracked_msgs (channel_id, msg_id) VALUES (?, ?)", (channel_id, msg_id))
                 cursor.execute("UPDATE channel_state SET expecting_next = 0 WHERE channel_id = ?", (channel_id,))
-        
         conn.commit()
 
 def main():
     init_db()
     application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Existing Handler
     application.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_channel_post))
     
-    logger.info("Bot is running with Toss Logic and Content Moderation...")
+    # Background Job: Checks for Toss deletions every 2 minutes (120 seconds)
+    application.job_queue.run_repeating(check_for_deletions, interval=120, first=10)
+    
+    logger.info("Bot is running with ALL features merged...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
