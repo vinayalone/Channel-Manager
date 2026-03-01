@@ -108,9 +108,9 @@ async def trigger_toss_finish(context, channel_id, original_id, bot_reply_id):
         pass
     
     follow_up = (
-        "**As I Said Toss Normal Limit Se Hi Khelna Hota Hai \n\n "
-        "10% Amount Hi Loss Hua Hai Overall Hum Same Limit Se Play Krte He Hai Toh Profit Me Nikalte He Hai. \n\n"
-        "Baaki Session Me Cover Krte Hai...❤️**"
+        "**As I Said Toss Normal Limit Se Hi Khelna Hota Hai**\n\n "
+        "**10% Amount Hi Loss Hua Hai Overall Hum Same Limit Se Play Krte He Hai Toh Profit Me Nikalte He Hai**.\n\n"
+        "**Baaki Session Me Cover Krte Hai...❤️**"
     )
     await context.bot.send_message(chat_id=channel_id, text=follow_up, parse_mode=ParseMode.MARKDOWN)
     
@@ -129,7 +129,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     # 1. New Feature: Toss Winner Check
     if TOSS_REGEX.search(text):
-        reply_text = "**Always Play Toss In Small Limits \n\nAgr ID Me 10K Hai Toh Toss 1K Se Khelo Only...👆**"
+        reply_text = "**Always Play Toss In Small Limits**\n\n**Agr ID Me 10K Hai Toh Toss 1K Se Khelo Only...👆**"
         reply_msg = await message.reply_text(reply_text, parse_mode=ParseMode.MARKDOWN)
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute("INSERT OR REPLACE INTO toss_tracker VALUES (?, ?, ?)", 
