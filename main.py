@@ -14,7 +14,10 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("CRITICAL: BOT_TOKEN environment variable is missing.")
 
-DB_PATH = os.environ.get("DB_PATH", "bot_state.db")
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL is missing.")
+
 db_pool = None
 
 # 🔴 REPLACE THIS WITH YOUR PRIVATE LOG GROUP ID
@@ -46,11 +49,9 @@ TOSS_REGEX = re.compile(r'toss winner', re.IGNORECASE)
 
 # ================= DATABASE =================
 
-db_pool = None
-
 async def init_postgres(application: Application):
     global db_pool
-    db_pool = await asyncpg.create_pool(os.environ["DATABASE_URL"])
+    db_pool = await asyncpg.create_pool(DATABASE_URL)
 
     async with db_pool.acquire() as conn:
         await conn.execute("""
@@ -259,29 +260,6 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
                     SET expecting_next = FALSE
                     WHERE channel_id=$1
                 """, channel_id)
-            
-# ================= MAIN =================
-
-async def init_postgres(application: Application):
-    global db_pool
-    db_pool = await asyncpg.create_pool(os.environ["DATABASE_URL"])
-
-    async with db_pool.acquire() as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS tracked_msgs (
-                channel_id BIGINT PRIMARY KEY,
-                msg_id BIGINT
-            );
-        """)
-
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS channel_state (
-                channel_id BIGINT PRIMARY KEY,
-                expecting_next BOOLEAN
-            );
-        """)
-
-    logger.info("PostgreSQL connected and tables ready.")
 
 def main():
     application = (
