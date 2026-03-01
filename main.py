@@ -1,6 +1,7 @@
 import os
 import logging
 import sqlite3
+from html import escape
 import re
 from telegram import Update
 from telegram.constants import ParseMode
@@ -94,15 +95,16 @@ def is_spam_message(message) -> bool:
     return False
 
 # ================= TOSS FINISH =================
-
 async def trigger_toss_finish(context, channel_id, reply_id, original_text):
     try:
         await context.bot.delete_message(chat_id=channel_id, message_id=reply_id)
     except:
         pass
 
+    safe_text = escape(original_text)
+
     final_message = (
-        f"<b>{original_text}</b>\n\n"
+        f"<b>{safe_text}</b>\n\n"
         "<b>Loss ❌</b>\n\n"
         "<b>As I Said Toss Normal Limit Se Hi Khelna Hota Hai</b>\n\n"
         "<b>10% Amount Hi Loss Hua Hai Overall Hum Same Limit Se Play Krte He Hai "
@@ -136,10 +138,10 @@ async def check_single_toss(context: ContextTypes.DEFAULT_TYPE):
             message_id=temp.message_id
         )
 
-        # Message still exists → do nothing
-
-    except BadRequest:
-        # Message deleted → trigger instantly
+  except BadRequest as e:
+    print("COPY ERROR:", str(e))
+    if "not found" in str(e).lower():
+        print("MESSAGE DELETED DETECTED")
         await trigger_toss_finish(
             context,
             channel_id,
