@@ -3,9 +3,10 @@ import logging
 import sqlite3
 import re
 from telegram import Update
+
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, MessageHandler, filters, ContextTypes, JobQueue
 
 # Enable logging
 logging.basicConfig(
@@ -159,29 +160,39 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
                 cursor.execute("UPDATE channel_state SET expecting_next = 0 WHERE channel_id = ?", (channel_id,))
         conn.commit()
 
-from telegram.ext import JobQueue  # Ensure this import is at the top
+# ... (keep all your other functions: init_db, is_spam_message, etc. exactly as they are)
 
 def main():
+    """Bypasses the Python 3.13 weakref bug by manual JobQueue injection."""
     init_db()
     
-    # 1. Create a JobQueue instance manually
-    job_queue = JobQueue()
-    
-    # 2. Pass it into the builder explicitly
+    # 2. Build the application WITHOUT the internal JobQueue first
+    # We set job_queue=None to prevent the library from triggering the bug
     application = (
         Application.builder()
         .token(BOT_TOKEN)
-        .job_queue(job_queue) # This links them correctly for Python 3.13
+        .job_queue(None) 
         .build()
     )
     
-    # 3. Schedule the check for deletions (every 120 seconds)
+    # 3. Manually create and link the JobQueue
+    # This avoids the 'weakref' error by linking after the Application is fully built
+    job_queue = JobQueue()
+    job_queue.set_application(application)
+    application.job_queue = job_queue
+    
+    # 4. Initialize the JobQueue (APScheduler)
+    job_queue.start()
+
+    # 5. Schedule your 2-minute Toss monitor
     application.job_queue.run_repeating(check_for_deletions, interval=120, first=10)
 
-    # 4. Add the existing message handler
+    # 6. Add your existing moderation handler
     application.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_channel_post))
     
-    logger.info("Bot is running. Monitor scheduled every 2 minutes.")
+    logger.info("Bot started successfully on Python 3.13 with Heartbeat monitor.")
+    
+    # Use run_polling directly
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
