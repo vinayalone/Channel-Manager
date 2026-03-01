@@ -102,21 +102,26 @@ async def check_for_deletions(context: ContextTypes.DEFAULT_TYPE):
 
 async def trigger_toss_finish(context, channel_id, original_id, bot_reply_id):
     """Deletes the reply and sends the bold follow-up message."""
-    try: 
+    try:
         await context.bot.delete_message(chat_id=channel_id, message_id=bot_reply_id)
-    except: 
+    except:
         pass
-    
+
     follow_up = (
-        "**As I Said Toss Normal Limit Se Hi Khelna Hota Hai**\n\n "
-        "**10% Amount Hi Loss Hua Hai Overall Hum Same Limit Se Play Krte He Hai Toh Profit Me Nikalte He Hai**.\n\n"
-        "**Baaki Session Me Cover Krte Hai...❤️**"
+        "<b>As I Said Toss Normal Limit Se Hi Khelna Hota Hai</b>\n\n"
+        "<b>10% Amount Hi Loss Hua Hai Overall Hum Same Limit Se Play Krte He Hai Toh Profit Me Nikalte He Hai.</b>\n\n"
+        "<b>Baaki Session Me Cover Krte Hai...❤️</b>"
     )
-    await context.bot.send_message(chat_id=channel_id, text=follow_up, parse_mode=ParseMode.MARKDOWN)
-    
+
+    await context.bot.send_message(
+        chat_id=channel_id,
+        text=follow_up,
+        parse_mode=ParseMode.HTML
+    )
+
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("DELETE FROM toss_tracker WHERE original_id = ?", (original_id,))
-
+        
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Main process for all features."""
     message = update.channel_post
@@ -126,38 +131,82 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     channel_id = message.chat_id
     msg_id = message.message_id
     text = (message.text or message.caption or "")
-    
-    # 1. New Feature: Toss Winner Check
+
+    # 1. Toss Winner Check
     if TOSS_REGEX.search(text):
-        reply_text = "**Always Play Toss In Small Limits**\n\n**Agr ID Me 10K Hai Toh Toss 1K Se Khelo Only...👆**"
-        reply_msg = await message.reply_text(reply_text, parse_mode=ParseMode.MARKDOWN)
+        reply_text = (
+            "<b>Always Play Toss In Small Limits</b>\n\n"
+            "<b>Agr ID Me 10K Hai Toh Toss 1K Se Khelo Only...👆</b>"
+        )
+
+        reply_msg = await message.reply_text(
+            reply_text,
+            parse_mode=ParseMode.HTML
+        )
+
         with sqlite3.connect(DB_PATH) as conn:
-            conn.execute("INSERT OR REPLACE INTO toss_tracker VALUES (?, ?, ?)", 
-                         (channel_id, msg_id, reply_msg.message_id))
+            conn.execute(
+                "INSERT OR REPLACE INTO toss_tracker VALUES (?, ?, ?)",
+                (channel_id, msg_id, reply_msg.message_id)
+            )
         return
 
-    # 2. Existing Feature: Poster/Moderation Logic
+    # 2. Poster / Moderation Logic
     is_poster = has_media_and_link(message)
 
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
+
         if is_poster:
-            cursor.execute("SELECT msg_id FROM tracked_msgs WHERE channel_id = ?", (channel_id,))
+            cursor.execute(
+                "SELECT msg_id FROM tracked_msgs WHERE channel_id = ?",
+                (channel_id,)
+            )
             old_msgs = cursor.fetchall()
+
             for (old_msg_id,) in old_msgs:
-                try: await context.bot.delete_message(chat_id=channel_id, message_id=old_msg_id)
-                except: pass
-            
-            cursor.execute("DELETE FROM tracked_msgs WHERE channel_id = ?", (channel_id,))
-            cursor.execute("INSERT INTO tracked_msgs (channel_id, msg_id) VALUES (?, ?)", (channel_id, msg_id))
-            cursor.execute("INSERT OR REPLACE INTO channel_state (channel_id, expecting_next) VALUES (?, 1)", (channel_id,))
+                try:
+                    await context.bot.delete_message(
+                        chat_id=channel_id,
+                        message_id=old_msg_id
+                    )
+                except:
+                    pass
+
+            cursor.execute(
+                "DELETE FROM tracked_msgs WHERE channel_id = ?",
+                (channel_id,)
+            )
+
+            cursor.execute(
+                "INSERT INTO tracked_msgs (channel_id, msg_id) VALUES (?, ?)",
+                (channel_id, msg_id)
+            )
+
+            cursor.execute(
+                "INSERT OR REPLACE INTO channel_state (channel_id, expecting_next) VALUES (?, 1)",
+                (channel_id,)
+            )
+
         else:
-            cursor.execute("SELECT expecting_next FROM channel_state WHERE channel_id = ?", (channel_id,))
+            cursor.execute(
+                "SELECT expecting_next FROM channel_state WHERE channel_id = ?",
+                (channel_id,)
+            )
             row = cursor.fetchone()
+
             if row and row[0] == 1:
                 if is_spam_message(message):
-                    cursor.execute("INSERT INTO tracked_msgs (channel_id, msg_id) VALUES (?, ?)", (channel_id, msg_id))
-                cursor.execute("UPDATE channel_state SET expecting_next = 0 WHERE channel_id = ?", (channel_id,))
+                    cursor.execute(
+                        "INSERT INTO tracked_msgs (channel_id, msg_id) VALUES (?, ?)",
+                        (channel_id, msg_id)
+                    )
+
+                cursor.execute(
+                    "UPDATE channel_state SET expecting_next = 0 WHERE channel_id = ?",
+                    (channel_id,)
+                )
+
         conn.commit()
 
 def main():
