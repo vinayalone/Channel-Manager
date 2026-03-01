@@ -200,64 +200,64 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     # ---------- MODERATION ----------
-is_poster = has_media_and_link(message)
+    is_poster = has_media_and_link(message)
 
-with sqlite3.connect(DB_PATH) as conn:
-    cursor = conn.cursor()
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
 
-    if is_poster:
-        # Get previous poster (ONLY ONE per channel now)
-        cursor.execute(
-            "SELECT msg_id FROM tracked_msgs WHERE channel_id = ?",
-            (channel_id,)
-        )
-        row = cursor.fetchone()
-
-        if row:
-            old_msg_id = row[0]
-            try:
-                await context.bot.delete_message(
-                    chat_id=channel_id,
-                    message_id=old_msg_id
-                )
-            except Exception as e:
-                print("POSTER DELETE ERROR:", e)
-
-        # Store new poster (replace old automatically)
-        cursor.execute(
-            "INSERT OR REPLACE INTO tracked_msgs (channel_id, msg_id) VALUES (?, ?)",
-            (channel_id, msg_id)
-        )
-
-        # Mark expecting next message
-        cursor.execute(
-            "INSERT OR REPLACE INTO channel_state (channel_id, expecting_next) VALUES (?, 1)",
-            (channel_id,)
-        )
-
-    else:
-        cursor.execute(
-            "SELECT expecting_next FROM channel_state WHERE channel_id = ?",
-            (channel_id,)
-        )
-        row = cursor.fetchone()
-
-        if row and row[0] == 1:
-
-            if is_spam_message(message):
-                # Track spam message if needed
-                cursor.execute(
-                    "INSERT OR REPLACE INTO tracked_msgs (channel_id, msg_id) VALUES (?, ?)",
-                    (channel_id, msg_id)
-                )
-
-            # Reset expecting state
+        if is_poster:
+            # Get previous poster (ONLY ONE per channel now)
             cursor.execute(
-                "UPDATE channel_state SET expecting_next = 0 WHERE channel_id = ?",
+                "SELECT msg_id FROM tracked_msgs WHERE channel_id = ?",
+                (channel_id,)
+            )
+            row = cursor.fetchone()
+
+            if row:
+                old_msg_id = row[0]
+                try:
+                    await context.bot.delete_message(
+                        chat_id=channel_id,
+                        message_id=old_msg_id
+                    )
+                except Exception as e:
+                    print("POSTER DELETE ERROR:", e)
+
+            # Store new poster (replace old automatically)
+            cursor.execute(
+                "INSERT OR REPLACE INTO tracked_msgs (channel_id, msg_id) VALUES (?, ?)",
+                (channel_id, msg_id)
+            )
+
+            # Mark expecting next message
+            cursor.execute(
+                "INSERT OR REPLACE INTO channel_state (channel_id, expecting_next) VALUES (?, 1)",
                 (channel_id,)
             )
 
-    conn.commit()
+        else:
+            cursor.execute(
+                "SELECT expecting_next FROM channel_state WHERE channel_id = ?",
+                (channel_id,)
+            )
+            row = cursor.fetchone()
+
+            if row and row[0] == 1:
+
+                if is_spam_message(message):
+                    # Track spam message if needed
+                    cursor.execute(
+                        "INSERT OR REPLACE INTO tracked_msgs (channel_id, msg_id) VALUES (?, ?)",
+                        (channel_id, msg_id)
+                    )
+
+                # Reset expecting state
+                cursor.execute(
+                    "UPDATE channel_state SET expecting_next = 0 WHERE channel_id = ?",
+                    (channel_id,)
+                )
+
+        conn.commit()
     
 # ================= MAIN =================
 def main():
