@@ -146,7 +146,11 @@ async def check_single_toss(context: ContextTypes.DEFAULT_TYPE):
         error_text = str(e).lower()
         print("COPY ERROR:", error_text)
 
-        if "not found" in error_text:
+        if any(x in error_text for x in [
+            "not found",
+            "message_id_invalid",
+            "message to copy not found"
+        ]):
             print("MESSAGE DELETED DETECTED")
 
             await trigger_toss_finish(
@@ -206,6 +210,10 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     # ---------- MODERATION ----------
+    if not db_pool:
+        logger.error("Database pool not initialized.")
+        return
+    
     is_poster = has_media_and_link(message)
 
     async with db_pool.acquire() as conn:
