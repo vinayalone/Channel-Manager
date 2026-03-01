@@ -1,6 +1,6 @@
 import os
 import logging
-import sqlite3
+import asyncpg
 from html import escape
 import re
 from telegram import Update
@@ -15,6 +15,7 @@ if not BOT_TOKEN:
     raise ValueError("CRITICAL: BOT_TOKEN environment variable is missing.")
 
 DB_PATH = os.environ.get("DB_PATH", "bot_state.db")
+db_pool = None
 
 # 🔴 REPLACE THIS WITH YOUR PRIVATE LOG GROUP ID
 LOG_CHAT_ID = -1003715442132
@@ -139,9 +140,10 @@ async def check_single_toss(context: ContextTypes.DEFAULT_TYPE):
         )
 
     except BadRequest as e:
-        print("COPY ERROR:", str(e))
+        error_text = str(e).lower()
+        print("COPY ERROR:", error_text)
 
-        if "not found" in str(e).lower():
+        if "not found" in error_text:
             print("MESSAGE DELETED DETECTED")
 
             await trigger_toss_finish(
@@ -150,6 +152,7 @@ async def check_single_toss(context: ContextTypes.DEFAULT_TYPE):
                 reply_id,
                 original_text
             )
+        
 def contains_link(message) -> bool:
     entities = message.caption_entities if message.caption else message.entities
 
@@ -260,12 +263,19 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         conn.commit()
     
 # ================= MAIN =================
+
+async def init_postgres(application: Application):
+    global db_pool
+    db_pool = await asyncpg.create_pool(os.environ["DATABASE_URL"])
+    logger.info("PostgreSQL connected successfully.")
+
 def main():
-    init_db()
+    init_db()  # keep SQLite for now if you still want it
 
     application = (
         Application.builder()
         .token(BOT_TOKEN)
+        .post_init(init_postgres)   # ✅ correct way
         .build()
     )
 
