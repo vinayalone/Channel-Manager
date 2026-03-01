@@ -52,7 +52,7 @@ def init_db():
 
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS tracked_msgs (
-                channel_id INTEGER,
+                channel_id INTEGER PRIMARY KEY,
                 msg_id INTEGER
             )
         """)
@@ -150,7 +150,18 @@ async def check_single_toss(context: ContextTypes.DEFAULT_TYPE):
                 reply_id,
                 original_text
             )
+def contains_link(message) -> bool:
+    entities = message.caption_entities if message.caption else message.entities
 
+    if entities and any(ent.type in ['url', 'text_link'] for ent in entities):
+        return True
+
+    text = message.text or message.caption or ""
+    if "http://" in text.lower() or "https://" in text.lower() or "t.me" in text.lower():
+        return True
+
+    return False
+    
 # ================= MAIN HANDLER =================
 
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -163,7 +174,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = (message.text or message.caption or "")
 
     # ---------- TOSS CHECK ----------
-    if TOSS_REGEX.search(text):
+    if TOSS_REGEX.search(text) and not contains_link(message):
 
         reply_text = (
             "<b>Always Play Toss In Small Limits</b>\n\n"
@@ -189,65 +200,66 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     # ---------- MODERATION ----------
-    is_poster = has_media_and_link(message)
+is_poster = has_media_and_link(message)
 
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
+with sqlite3.connect(DB_PATH) as conn:
+    cursor = conn.cursor()
 
-        if is_poster:
-            cursor.execute(
-                "SELECT msg_id FROM tracked_msgs WHERE channel_id = ?",
-                (channel_id,)
-            )
-            old_msgs = cursor.fetchall()
+    if is_poster:
+        # Get previous poster (ONLY ONE per channel now)
+        cursor.execute(
+            "SELECT msg_id FROM tracked_msgs WHERE channel_id = ?",
+            (channel_id,)
+        )
+        row = cursor.fetchone()
 
-            for (old_msg_id,) in old_msgs:
-                try:
-                    await context.bot.delete_message(
-                        chat_id=channel_id,
-                        message_id=old_msg_id
-                    )
-                except:
-                    pass
+        if row:
+            old_msg_id = row[0]
+            try:
+                await context.bot.delete_message(
+                    chat_id=channel_id,
+                    message_id=old_msg_id
+                )
+            except Exception as e:
+                print("POSTER DELETE ERROR:", e)
 
-            cursor.execute(
-                "DELETE FROM tracked_msgs WHERE channel_id = ?",
-                (channel_id,)
-            )
+        # Store new poster (replace old automatically)
+        cursor.execute(
+            "INSERT OR REPLACE INTO tracked_msgs (channel_id, msg_id) VALUES (?, ?)",
+            (channel_id, msg_id)
+        )
 
-            cursor.execute(
-                "INSERT INTO tracked_msgs (channel_id, msg_id) VALUES (?, ?)",
-                (channel_id, msg_id)
-            )
+        # Mark expecting next message
+        cursor.execute(
+            "INSERT OR REPLACE INTO channel_state (channel_id, expecting_next) VALUES (?, 1)",
+            (channel_id,)
+        )
 
-            cursor.execute(
-                "INSERT OR REPLACE INTO channel_state (channel_id, expecting_next) VALUES (?, 1)",
-                (channel_id,)
-            )
+    else:
+        cursor.execute(
+            "SELECT expecting_next FROM channel_state WHERE channel_id = ?",
+            (channel_id,)
+        )
+        row = cursor.fetchone()
 
-        else:
-            cursor.execute(
-                "SELECT expecting_next FROM channel_state WHERE channel_id = ?",
-                (channel_id,)
-            )
-            row = cursor.fetchone()
+        if row and row[0] == 1:
 
-            if row and row[0] == 1:
-                if is_spam_message(message):
-                    cursor.execute(
-                        "INSERT INTO tracked_msgs (channel_id, msg_id) VALUES (?, ?)",
-                        (channel_id, msg_id)
-                    )
-
+            if is_spam_message(message):
+                # Track spam message if needed
                 cursor.execute(
-                    "UPDATE channel_state SET expecting_next = 0 WHERE channel_id = ?",
-                    (channel_id,)
+                    "INSERT OR REPLACE INTO tracked_msgs (channel_id, msg_id) VALUES (?, ?)",
+                    (channel_id, msg_id)
                 )
 
-        conn.commit()
+            # Reset expecting state
+            cursor.execute(
+                "UPDATE channel_state SET expecting_next = 0 WHERE channel_id = ?",
+                (channel_id,)
+            )
 
+    conn.commit()
+    
 # ================= MAIN =================
-
 def main():
     init_db()
 
