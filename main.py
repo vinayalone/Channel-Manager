@@ -105,7 +105,7 @@ async def trigger_toss_finish(context, channel_id, reply_id, original_text):
 
     final_message = (
         f"<b>{safe_text}</b>"
-        "<b>Loss ❌</b>\n\n"
+        "<b> Loss ❌</b>\n\n"
         "<b>As I Said Toss Normal Limit Se Hi Khelna Hota Hai</b>\n\n"
         "<b>10% Amount Hi Loss Hua Hai Overall Hum Same Limit Se Play Krte He Hai "
         "Toh Profit Me Nikalte He Hai.</b>\n\n"
