@@ -161,13 +161,21 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 def main():
     init_db()
+    
+    # Initialize application
     application = Application.builder().token(BOT_TOKEN).build()
     
+    # Check if job_queue is actually available
+    if application.job_queue is None:
+        logger.error("JobQueue is not available. Background monitoring will not work.")
+        logger.error("FIX: Install with 'pip install \"python-telegram-bot[job-queue]\"'")
+    else:
+        # Background Job: Checks for Toss deletions every 120 seconds
+        application.job_queue.run_repeating(check_for_deletions, interval=120, first=10)
+        logger.info("Heartbeat monitor scheduled successfully.")
+
     # Existing Handler
     application.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_channel_post))
-    
-    # Background Job: Checks for Toss deletions every 2 minutes (120 seconds)
-    application.job_queue.run_repeating(check_for_deletions, interval=120, first=10)
     
     logger.info("Bot is running with ALL features merged...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
