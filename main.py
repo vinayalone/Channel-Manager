@@ -83,21 +83,23 @@ def is_spam_message(message) -> bool:
     return False
 
 async def check_for_deletions(context: ContextTypes.DEFAULT_TYPE):
-    """New Feature: Background Monitor runs every 2 minutes."""
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT channel_id, original_id, bot_reply_id FROM toss_tracker")
         active_tosses = cursor.fetchall()
 
     for channel_id, original_id, bot_reply_id in active_tosses:
-        # Check if message is still there by attempting to delete it
-        # If it fails with 'not found', YOU deleted it. 
-        # If it succeeds, WE just deleted it (counting as 'gone').
         try:
-            await context.bot.delete_message(chat_id=channel_id, message_id=original_id)
-            await trigger_toss_finish(context, channel_id, original_id, bot_reply_id)
+            # Try forwarding the message to itself (safe existence check)
+            await context.bot.forward_message(
+                chat_id=channel_id,
+                from_chat_id=channel_id,
+                message_id=original_id
+            )
+
         except BadRequest as e:
-            if "message to delete not found" in str(e).lower():
+            # If message doesn't exist
+            if "message to forward not found" in str(e).lower():
                 await trigger_toss_finish(context, channel_id, original_id, bot_reply_id)
 
 async def trigger_toss_finish(context, channel_id, original_id, bot_reply_id):
