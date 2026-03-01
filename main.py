@@ -138,16 +138,18 @@ async def check_single_toss(context: ContextTypes.DEFAULT_TYPE):
             message_id=temp.message_id
         )
 
-  except BadRequest as e:
-    print("COPY ERROR:", str(e))
-    if "not found" in str(e).lower():
-        print("MESSAGE DELETED DETECTED")
-        await trigger_toss_finish(
-            context,
-            channel_id,
-            reply_id,
-            original_text
-        )
+    except BadRequest as e:
+        print("COPY ERROR:", str(e))
+
+        if "not found" in str(e).lower():
+            print("MESSAGE DELETED DETECTED")
+
+            await trigger_toss_finish(
+                context,
+                channel_id,
+                reply_id,
+                original_text
+            )
 
 # ================= MAIN HANDLER =================
 
