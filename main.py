@@ -6,7 +6,7 @@ from telegram import Update
 
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
-from telegram.ext import Application, MessageHandler, filters, ContextTypes, JobQueue
+from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
 # Enable logging
 logging.basicConfig(
@@ -169,7 +169,7 @@ def main():
         .build()
     )
 
-    # Schedule 2-minute Toss monitor
+    # Use built-in JobQueue (already configured properly)
     application.job_queue.run_repeating(
         check_for_deletions,
         interval=120,
