@@ -1,6 +1,7 @@
 import os
 import logging
 import sqlite3
+import re
 from telegram import Update
 from telegram.error import BadRequest
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
@@ -16,8 +17,16 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("CRITICAL: BOT_TOKEN environment variable is missing.")
 
-# Allow DB path to be overridden via env var for persistent volume mounting
 DB_PATH = os.environ.get("DB_PATH", "bot_state.db")
+
+# Compile the blacklist regex once at startup for high performance
+BLACKLIST = [
+    "casino", "stakeid", "stake", "bharosa", "punters", "service", 
+    "download", "bonus", "right", "circle", "red", "bet", "exclusive", 
+    "site", "platform", "registed", "khelo", "safe", "betting", "book"
+]
+# \b ensures we only match whole words (e.g., 'bet' won't match 'better')
+BLACKLIST_REGEX = re.compile(r'\b(?:' + '|'.join(BLACKLIST) + r')\b', re.IGNORECASE)
 
 def init_db():
     """Initializes the SQLite database to survive bot restarts."""
@@ -39,11 +48,38 @@ def init_db():
         conn.commit()
 
 def has_media_and_link(message) -> bool:
-    """Checks if the message contains both media (poster) and a link."""
+    """Checks if the message is a Poster (contains media AND a link)."""
     has_media = bool(message.photo or message.video or message.document)
     entities = message.caption_entities if message.caption else message.entities
     has_link = any(ent.type in ['url', 'text_link'] for ent in entities) if entities else False
     return has_media and has_link
+
+def is_spam_message(message) -> bool:
+    """Evaluates if the subsequent message violates the channel rules."""
+    
+    # 1. Check for Links (in text or media captions)
+    entities = message.caption_entities if message.caption else message.entities
+    if entities and any(ent.type in ['url', 'text_link'] for ent in entities):
+        return True
+        
+    # 2. Check for APK files
+    if message.document and message.document.file_name:
+        if message.document.file_name.lower().endswith('.apk'):
+            return True
+            
+    # 3. Check for Audio/Voice + Caption requirement
+    # If it's audio or a voice note, and it HAS a caption, delete it.
+    if (message.audio or message.voice) and message.caption:
+        logger.info("Audio/Voice with caption detected. Triggering deletion.")
+        return True
+        
+    # 4. Check for Blacklisted Words (case-insensitive)
+    # We check both message.text (standard msg) and message.caption (media msg)
+    text_to_check = message.text or message.caption or ""
+    if text_to_check and BLACKLIST_REGEX.search(text_to_check):
+        return True
+        
+    return False
 
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Processes every new message in the channel."""
@@ -59,7 +95,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         cursor = conn.cursor()
         
         if is_poster:
-            logger.info(f"New Poster+Link detected in {channel_id}. Deleting previous...")
+            logger.info(f"New Poster+Link detected in {channel_id}. Deleting previous tracking...")
             cursor.execute("SELECT msg_id FROM tracked_msgs WHERE channel_id = ?", (channel_id,))
             old_msgs = cursor.fetchall()
             
@@ -78,8 +114,14 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             row = cursor.fetchone()
             
             if row and row[0] == 1:
-                logger.info(f"Tracking subsequent message {msg_id} in {channel_id}.")
-                cursor.execute("INSERT INTO tracked_msgs (channel_id, msg_id) VALUES (?, ?)", (channel_id, msg_id))
+                # We are looking at the message immediately below the poster.
+                if is_spam_message(message):
+                    logger.info(f"Spam rules violated in subsequent message {msg_id}. Tracking for deletion.")
+                    cursor.execute("INSERT INTO tracked_msgs (channel_id, msg_id) VALUES (?, ?)", (channel_id, msg_id))
+                else:
+                    logger.info(f"Subsequent message {msg_id} is clean. Ignoring.")
+                
+                # Reset the state so we stop evaluating 3rd, 4th, etc. messages
                 cursor.execute("UPDATE channel_state SET expecting_next = 0 WHERE channel_id = ?", (channel_id,))
         
         conn.commit()
@@ -89,7 +131,7 @@ def main():
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_channel_post))
     
-    logger.info("Bot is running...")
+    logger.info("Bot is running with strict content moderation enabled...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
