@@ -46,27 +46,29 @@ TOSS_REGEX = re.compile(r'toss winner', re.IGNORECASE)
 
 # ================= DATABASE =================
 
-def init_db():
-    logger.info(f"Using database at: {DB_PATH}")
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
+db_pool = None
 
-        cursor.execute("""
+async def init_postgres(application: Application):
+    global db_pool
+    db_pool = await asyncpg.create_pool(os.environ["DATABASE_URL"])
+
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS tracked_msgs (
-                channel_id INTEGER PRIMARY KEY,
-                msg_id INTEGER
-            )
+                channel_id BIGINT PRIMARY KEY,
+                msg_id BIGINT
+            );
         """)
 
-        cursor.execute("""
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS channel_state (
-                channel_id INTEGER PRIMARY KEY,
+                channel_id BIGINT PRIMARY KEY,
                 expecting_next BOOLEAN
-            )
+            );
         """)
 
-        conn.commit()
-
+    logger.info("PostgreSQL connected and tables ready.")
+    
 # ================= HELPERS =================
 
 def has_media_and_link(message) -> bool:
@@ -203,65 +205,61 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     # ---------- MODERATION ----------
-    is_poster = has_media_and_link(message)
+is_poster = has_media_and_link(message)
 
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
+async with db_pool.acquire() as conn:
 
-        if is_poster:
-            # Get previous poster (ONLY ONE per channel now)
-            cursor.execute(
-                "SELECT msg_id FROM tracked_msgs WHERE channel_id = ?",
-                (channel_id,)
-            )
-            row = cursor.fetchone()
+    if is_poster:
+        row = await conn.fetchrow(
+            "SELECT msg_id FROM tracked_msgs WHERE channel_id=$1",
+            channel_id
+        )
 
-            if row:
-                old_msg_id = row[0]
-                try:
-                    await context.bot.delete_message(
-                        chat_id=channel_id,
-                        message_id=old_msg_id
-                    )
-                except Exception as e:
-                    print("POSTER DELETE ERROR:", e)
-
-            # Store new poster (replace old automatically)
-            cursor.execute(
-                "INSERT OR REPLACE INTO tracked_msgs (channel_id, msg_id) VALUES (?, ?)",
-                (channel_id, msg_id)
-            )
-
-            # Mark expecting next message
-            cursor.execute(
-                "INSERT OR REPLACE INTO channel_state (channel_id, expecting_next) VALUES (?, 1)",
-                (channel_id,)
-            )
-
-        else:
-            cursor.execute(
-                "SELECT expecting_next FROM channel_state WHERE channel_id = ?",
-                (channel_id,)
-            )
-            row = cursor.fetchone()
-
-            if row and row[0] == 1:
-
-                if is_spam_message(message):
-                    # Track spam message if needed
-                    cursor.execute(
-                        "INSERT OR REPLACE INTO tracked_msgs (channel_id, msg_id) VALUES (?, ?)",
-                        (channel_id, msg_id)
-                    )
-
-                # Reset expecting state
-                cursor.execute(
-                    "UPDATE channel_state SET expecting_next = 0 WHERE channel_id = ?",
-                    (channel_id,)
+        if row:
+            try:
+                await context.bot.delete_message(
+                    chat_id=channel_id,
+                    message_id=row["msg_id"]
                 )
+            except Exception as e:
+                print("POSTER DELETE ERROR:", e)
 
-        conn.commit()
-    
+        await conn.execute("""
+            INSERT INTO tracked_msgs(channel_id, msg_id)
+            VALUES($1, $2)
+            ON CONFLICT(channel_id)
+            DO UPDATE SET msg_id = EXCLUDED.msg_id
+        """, channel_id, msg_id)
+
+        await conn.execute("""
+            INSERT INTO channel_state(channel_id, expecting_next)
+            VALUES($1, TRUE)
+            ON CONFLICT(channel_id)
+            DO UPDATE SET expecting_next = TRUE
+        """, channel_id)
+
+    else:
+        row = await conn.fetchrow(
+            "SELECT expecting_next FROM channel_state WHERE channel_id=$1",
+            channel_id
+        )
+
+        if row and row["expecting_next"]:
+
+            if is_spam_message(message):
+                await conn.execute("""
+                    INSERT INTO tracked_msgs(channel_id, msg_id)
+                    VALUES($1, $2)
+                    ON CONFLICT(channel_id)
+                    DO UPDATE SET msg_id = EXCLUDED.msg_id
+                """, channel_id, msg_id)
+
+            await conn.execute("""
+                UPDATE channel_state
+                SET expecting_next = FALSE
+                WHERE channel_id=$1
+            """, channel_id)
+            
 # ================= MAIN =================
 
 async def init_postgres(application: Application):
@@ -270,12 +268,10 @@ async def init_postgres(application: Application):
     logger.info("PostgreSQL connected successfully.")
 
 def main():
-    init_db()  # keep SQLite for now if you still want it
-
     application = (
         Application.builder()
         .token(BOT_TOKEN)
-        .post_init(init_postgres)   # ✅ correct way
+        .post_init(init_postgres)
         .build()
     )
 
