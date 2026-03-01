@@ -1,2 +1,2 @@
+Python 3.11
 python-telegram-bot==21.0.1
-python-telegram-bot[job-queue]
