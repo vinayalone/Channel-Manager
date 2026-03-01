@@ -3,115 +3,108 @@ import logging
 import sqlite3
 import re
 from telegram import Update
-
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
-# Enable logging
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+# ================= CONFIG =================
 
-# Fetch environment variables
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("CRITICAL: BOT_TOKEN environment variable is missing.")
 
 DB_PATH = os.environ.get("DB_PATH", "bot_state.db")
 
-# Existing Blacklist Features
-BLACKLIST = [
-    "casino", "stakeid", "stake", "bharosa", "punters", "service", 
-    "download", "bonus", "right", "circle", "red", "bet", "exclusive", 
-    "site", "platform", "registed", "khelo", "safe", "betting", "book"
-]
-BLACKLIST_REGEX = re.compile(r'\b(?:' + '|'.join(BLACKLIST) + r')\b', re.IGNORECASE)
+# 🔴 REPLACE THIS WITH YOUR PRIVATE LOG GROUP ID
+LOG_CHAT_ID = -1003715442132
 
-# New Toss Winner Pattern
+# ==========================================
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# ================= BLACKLIST =================
+
+BLACKLIST = [
+    "casino", "stakeid", "stake", "bharosa", "punters", "service",
+    "download", "bonus", "right", "circle", "red", "bet",
+    "exclusive", "site", "platform", "registed",
+    "khelo", "safe", "betting", "book"
+]
+
+BLACKLIST_REGEX = re.compile(
+    r'\b(?:' + '|'.join(BLACKLIST) + r')\b',
+    re.IGNORECASE
+)
+
 TOSS_REGEX = re.compile(r'toss winner', re.IGNORECASE)
 
+# ================= DATABASE =================
+
 def init_db():
-    """Initializes the SQLite database with all tables."""
     logger.info(f"Using database at: {DB_PATH}")
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
-        # Table for existing Poster/Moderation tracking
+
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS tracked_msgs (
                 channel_id INTEGER,
                 msg_id INTEGER
             )
         """)
+
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS channel_state (
                 channel_id INTEGER PRIMARY KEY,
                 expecting_next BOOLEAN
             )
         """)
-        # New Table for Toss Monitoring
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS toss_tracker (
-                channel_id INTEGER,
-                original_id INTEGER PRIMARY KEY,
-                bot_reply_id INTEGER
-            )
-        """)
+
         conn.commit()
 
+# ================= HELPERS =================
+
 def has_media_and_link(message) -> bool:
-    """Existing Feature: Checks if the message is a Poster (contains media AND a link)."""
     has_media = bool(message.photo or message.video or message.document)
     entities = message.caption_entities if message.caption else message.entities
     has_link = any(ent.type in ['url', 'text_link'] for ent in entities) if entities else False
     return has_media and has_link
 
+
 def is_spam_message(message) -> bool:
-    """Existing Feature: APKs, Links, Audio+Caption, and Blacklist."""
     entities = message.caption_entities if message.caption else message.entities
+
     if entities and any(ent.type in ['url', 'text_link'] for ent in entities):
         return True
+
     if message.document and message.document.file_name:
         if message.document.file_name.lower().endswith('.apk'):
             return True
+
     if (message.audio or message.voice) and message.caption:
         return True
+
     text_to_check = message.text or message.caption or ""
     if text_to_check and BLACKLIST_REGEX.search(text_to_check):
         return True
+
     return False
 
-async def check_for_deletions(context: ContextTypes.DEFAULT_TYPE):
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT channel_id, original_id, bot_reply_id FROM toss_tracker")
-        active_tosses = cursor.fetchall()
+# ================= TOSS FINISH =================
 
-    for channel_id, original_id, bot_reply_id in active_tosses:
-        try:
-            # Try forwarding the message to itself (safe existence check)
-            await context.bot.forward_message(
-                chat_id=channel_id,
-                from_chat_id=channel_id,
-                message_id=original_id
-            )
-
-        except BadRequest as e:
-            # If message doesn't exist
-            if "message to forward not found" in str(e).lower():
-                await trigger_toss_finish(context, channel_id, original_id, bot_reply_id)
-
-async def trigger_toss_finish(context, channel_id, original_id, bot_reply_id):
-    """Deletes the reply and sends the bold follow-up message."""
+async def trigger_toss_finish(context, channel_id, reply_id):
     try:
-        await context.bot.delete_message(chat_id=channel_id, message_id=bot_reply_id)
+        await context.bot.delete_message(chat_id=channel_id, message_id=reply_id)
     except:
         pass
 
     follow_up = (
         "<b>As I Said Toss Normal Limit Se Hi Khelna Hota Hai</b>\n\n"
-        "<b>10% Amount Hi Loss Hua Hai Overall Hum Same Limit Se Play Krte He Hai Toh Profit Me Nikalte He Hai.</b>\n\n"
+        "<b>10% Amount Hi Loss Hua Hai Overall Hum Same Limit Se Play Krte He Hai "
+        "Toh Profit Me Nikalte He Hai.</b>\n\n"
         "<b>Baaki Session Me Cover Krte Hai...❤️</b>"
     )
 
@@ -121,11 +114,35 @@ async def trigger_toss_finish(context, channel_id, original_id, bot_reply_id):
         parse_mode=ParseMode.HTML
     )
 
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("DELETE FROM toss_tracker WHERE original_id = ?", (original_id,))
-        
+# ================= SAFE DELETION CHECK =================
+
+async def check_single_toss(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.data
+    channel_id = data["channel_id"]
+    original_id = data["original_id"]
+    reply_id = data["reply_id"]
+
+    try:
+        # Copy to hidden log group
+        temp = await context.bot.copy_message(
+            chat_id=LOG_CHAT_ID,
+            from_chat_id=channel_id,
+            message_id=original_id
+        )
+
+        # Delete copy instantly
+        await context.bot.delete_message(
+            chat_id=LOG_CHAT_ID,
+            message_id=temp.message_id
+        )
+
+    except BadRequest:
+        # If copy fails → original deleted
+        await trigger_toss_finish(context, channel_id, reply_id)
+
+# ================= MAIN HANDLER =================
+
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Main process for all features."""
     message = update.channel_post
     if not message:
         return
@@ -134,8 +151,9 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     msg_id = message.message_id
     text = (message.text or message.caption or "")
 
-    # 1. Toss Winner Check
+    # ---------- TOSS CHECK ----------
     if TOSS_REGEX.search(text):
+
         reply_text = (
             "<b>Always Play Toss In Small Limits</b>\n\n"
             "<b>Agr ID Me 10K Hai Toh Toss 1K Se Khelo Only...👆</b>"
@@ -146,14 +164,19 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             parse_mode=ParseMode.HTML
         )
 
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO toss_tracker VALUES (?, ?, ?)",
-                (channel_id, msg_id, reply_msg.message_id)
-            )
+        context.job_queue.run_once(
+            check_single_toss,
+            when=120,
+            data={
+                "channel_id": channel_id,
+                "original_id": msg_id,
+                "reply_id": reply_msg.message_id
+            }
+        )
+
         return
 
-    # 2. Poster / Moderation Logic
+    # ---------- MODERATION ----------
     is_poster = has_media_and_link(message)
 
     with sqlite3.connect(DB_PATH) as conn:
@@ -211,6 +234,8 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         conn.commit()
 
+# ================= MAIN =================
+
 def main():
     init_db()
 
@@ -220,13 +245,6 @@ def main():
         .build()
     )
 
-    # Use built-in JobQueue (already configured properly)
-    application.job_queue.run_repeating(
-        check_for_deletions,
-        interval=120,
-        first=10
-    )
-
     application.add_handler(
         MessageHandler(filters.ChatType.CHANNEL, handle_channel_post)
     )
@@ -234,6 +252,6 @@ def main():
     logger.info("Bot started successfully.")
 
     application.run_polling(allowed_updates=Update.ALL_TYPES)
-    
+
 if __name__ == "__main__":
     main()
