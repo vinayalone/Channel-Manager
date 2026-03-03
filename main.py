@@ -37,7 +37,6 @@ BLACKLIST = [
     "download", "bonus", "circle", "red", "bet",
     "exclusive", "platform", "registed",
     "khelo", "safe", "betting", "book", "Guranteed"
-    # Removed "right", "site", "ID" — too broad, causes false positives
 ]
 
 BLACKLIST_REGEX = re.compile(
@@ -71,26 +70,32 @@ async def init_postgres(application: Application):
 
 # ================= HELPERS =================
 
-def has_media_and_link(message) -> bool:
-    has_media = bool(message.photo or message.video or message.document)
-    entities = message.caption_entities if message.caption else message.entities
-    has_link = any(ent.type in ['url', 'text_link'] for ent in entities) if entities else False
-    return has_media and has_link
+def is_poster(message) -> bool:
+    """
+    BUG 1 FIX: Old code required media + link entity in caption.
+    Many posters are just photos/videos with no clickable link entity.
+    Fix: any photo or video = poster. Documents excluded (often spam APKs).
+    """
+    return bool(message.photo or message.video)
 
 
-def is_spam_message(message) -> bool:
-    entities = message.caption_entities if message.caption else message.entities
-
-    if entities and any(ent.type in ['url', 'text_link'] for ent in entities):
-        return True
-
+def is_hard_spam(message) -> bool:
+    """
+    BUG 2 FIX: Old code flagged ANY message with a link as spam after a poster.
+    This deleted legitimate admin follow-up messages that contained links.
+    Fix: only catch unambiguous spam — APK, audio+caption, blacklisted words.
+    Links alone are no longer flagged (admin may post legit links after a poster).
+    """
+    # APK file attachment
     if message.document and message.document.file_name:
         if message.document.file_name.lower().endswith('.apk'):
             return True
 
+    # Audio or voice with caption
     if (message.audio or message.voice) and message.caption:
         return True
 
+    # Blacklisted keywords
     text_to_check = message.text or message.caption or ""
     if text_to_check and BLACKLIST_REGEX.search(text_to_check):
         return True
@@ -100,14 +105,11 @@ def is_spam_message(message) -> bool:
 
 def contains_link(message) -> bool:
     entities = message.caption_entities if message.caption else message.entities
-
     if entities and any(ent.type in ['url', 'text_link'] for ent in entities):
         return True
-
     text = message.text or message.caption or ""
     if "http://" in text.lower() or "https://" in text.lower() or "t.me" in text.lower():
         return True
-
     return False
 
 # ================= TOSS FINISH =================
@@ -127,7 +129,6 @@ async def trigger_toss_finish(context, channel_id, reply_id, original_text):
         "Toh Profit Me Nikalte He Hai.</b>\n\n"
         "<b>Baaki Session Me Cover Krte Hai...❤️</b>"
     )
-
     try:
         await context.bot.send_message(
             chat_id=channel_id,
@@ -152,18 +153,14 @@ async def check_single_toss(context: ContextTypes.DEFAULT_TYPE):
             from_chat_id=channel_id,
             message_id=original_id
         )
-        await context.bot.delete_message(
-            chat_id=LOG_CHAT_ID,
-            message_id=temp.message_id
-        )
+        await context.bot.delete_message(chat_id=LOG_CHAT_ID, message_id=temp.message_id)
         logger.info("Toss message still exists (channel=%s, msg=%s)", channel_id, original_id)
 
     except BadRequest as e:
         error_text = str(e).lower()
-        logger.info("Toss copy check error (channel=%s): %s", channel_id, error_text)
-
+        logger.info("Toss copy check (channel=%s): %s", channel_id, error_text)
         if any(x in error_text for x in ["not found", "message_id_invalid", "message to copy not found"]):
-            logger.info("Toss message deleted — sending loss message (channel=%s)", channel_id)
+            logger.info("Toss deleted — sending loss message (channel=%s)", channel_id)
             await trigger_toss_finish(context, channel_id, reply_id, original_text)
 
     except Exception as e:
@@ -207,28 +204,34 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.error("Database pool not initialized.")
         return
 
-    is_poster = has_media_and_link(message)
+    msg_is_poster = is_poster(message)
 
     async with db_pool.acquire() as conn:
 
-        if is_poster:
-            # ✅ KEY FIX: tracked_msgs ALWAYS holds the poster ID — delete the old poster here
+        if msg_is_poster:
+            # ── Delete the PREVIOUS poster ──
             row = await conn.fetchrow(
                 "SELECT msg_id FROM tracked_msgs WHERE channel_id=$1", channel_id
             )
             if row:
                 try:
-                    await context.bot.delete_message(chat_id=channel_id, message_id=row["msg_id"])
+                    await context.bot.delete_message(
+                        chat_id=channel_id,
+                        message_id=row["msg_id"]
+                    )
                     logger.info("Deleted old poster (channel=%s, msg=%s)", channel_id, row["msg_id"])
+                except BadRequest as e:
+                    logger.warning("Old poster already gone (msg=%s): %s", row["msg_id"], e)
                 except Exception as e:
-                    logger.warning("Could not delete old poster (msg=%s): %s", row["msg_id"], e)
+                    logger.error("Could not delete old poster (msg=%s): %s", row["msg_id"], e)
 
-            # Store the new poster ID — never overwrite with spam
+            # ── Store ONLY the new poster ID ──
             await conn.execute("""
                 INSERT INTO tracked_msgs(channel_id, msg_id) VALUES($1, $2)
                 ON CONFLICT(channel_id) DO UPDATE SET msg_id = EXCLUDED.msg_id
             """, channel_id, msg_id)
 
+            # ── Watch next message for hard spam ──
             await conn.execute("""
                 INSERT INTO channel_state(channel_id, expecting_next) VALUES($1, TRUE)
                 ON CONFLICT(channel_id) DO UPDATE SET expecting_next = TRUE
@@ -242,17 +245,21 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
 
             if row and row["expecting_next"]:
-                if is_spam_message(message):
-                    # ✅ KEY FIX: Delete spam immediately — do NOT touch tracked_msgs
-                    try:
-                        await context.bot.delete_message(chat_id=channel_id, message_id=msg_id)
-                        logger.info("Deleted spam (channel=%s, msg=%s)", channel_id, msg_id)
-                    except Exception as e:
-                        logger.warning("Could not delete spam (msg=%s): %s", msg_id, e)
-
+                # Reset FIRST — only one message checked per poster cycle
                 await conn.execute("""
                     UPDATE channel_state SET expecting_next = FALSE WHERE channel_id=$1
                 """, channel_id)
+
+                # Delete only hard spam (APK / blacklist / audio+caption) — NOT links
+                if is_hard_spam(message):
+                    try:
+                        await context.bot.delete_message(
+                            chat_id=channel_id,
+                            message_id=msg_id
+                        )
+                        logger.info("Deleted hard spam (channel=%s, msg=%s)", channel_id, msg_id)
+                    except Exception as e:
+                        logger.warning("Could not delete spam (msg=%s): %s", msg_id, e)
 
 # ================= ENTRY POINT =================
 
@@ -263,7 +270,9 @@ def main():
         .post_init(init_postgres)
         .build()
     )
-    application.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_channel_post))
+    application.add_handler(
+        MessageHandler(filters.ChatType.CHANNEL, handle_channel_post)
+    )
     logger.info("Bot started successfully.")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
