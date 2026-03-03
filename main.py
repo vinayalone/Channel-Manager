@@ -36,7 +36,7 @@ BLACKLIST = [
     "casino", "stakeid", "stake", "bharosa", "punters", "service",
     "download", "bonus", "circle", "red", "bet",
     "exclusive", "platform", "registed",
-    "khelo", "safe", "betting", "book", "Guranteed"
+    "khelo", "safe", "betting", "book", "Guranteed", "apk"
 ]
 
 BLACKLIST_REGEX = re.compile(
@@ -53,16 +53,12 @@ async def init_postgres(application: Application):
     db_pool = await asyncpg.create_pool(DATABASE_URL)
 
     async with db_pool.acquire() as conn:
+        # tracked_msgs stores ONLY the latest poster msg_id per channel
+        # channel_state table no longer needed — removed expecting_next logic
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS tracked_msgs (
                 channel_id BIGINT PRIMARY KEY,
                 msg_id BIGINT
-            );
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS channel_state (
-                channel_id BIGINT PRIMARY KEY,
-                expecting_next BOOLEAN DEFAULT FALSE
             );
         """)
 
@@ -71,31 +67,25 @@ async def init_postgres(application: Application):
 # ================= HELPERS =================
 
 def is_poster(message) -> bool:
-    """
-    BUG 1 FIX: Old code required media + link entity in caption.
-    Many posters are just photos/videos with no clickable link entity.
-    Fix: any photo or video = poster. Documents excluded (often spam APKs).
-    """
+    """Any photo or video = poster. Documents excluded (often spam APKs)."""
     return bool(message.photo or message.video)
 
 
 def is_hard_spam(message) -> bool:
     """
-    BUG 2 FIX: Old code flagged ANY message with a link as spam after a poster.
-    This deleted legitimate admin follow-up messages that contained links.
-    Fix: only catch unambiguous spam — APK, audio+caption, blacklisted words.
-    Links alone are no longer flagged (admin may post legit links after a poster).
+    Only catches unambiguous spam:
+    - APK file attachment
+    - Audio/voice with caption
+    - Blacklisted keywords (including 'apk', 'download', etc.)
+    Links alone are NOT flagged — admin may post legit links after a poster.
     """
-    # APK file attachment
     if message.document and message.document.file_name:
         if message.document.file_name.lower().endswith('.apk'):
             return True
 
-    # Audio or voice with caption
     if (message.audio or message.voice) and message.caption:
         return True
 
-    # Blacklisted keywords
     text_to_check = message.text or message.caption or ""
     if text_to_check and BLACKLIST_REGEX.search(text_to_check):
         return True
@@ -231,33 +221,25 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
                 ON CONFLICT(channel_id) DO UPDATE SET msg_id = EXCLUDED.msg_id
             """, channel_id, msg_id)
 
-            # ── Watch next message for hard spam ──
-            await conn.execute("""
-                INSERT INTO channel_state(channel_id, expecting_next) VALUES($1, TRUE)
-                ON CONFLICT(channel_id) DO UPDATE SET expecting_next = TRUE
-            """, channel_id)
-
             logger.info("New poster tracked (channel=%s, msg=%s)", channel_id, msg_id)
 
         else:
+            # ── KEY FIX: No DB flag needed. Check if this msg immediately follows the poster ──
+            # msg_id is always sequential in Telegram channels.
+            # If this message's ID == poster_msg_id + 1, it's the message right after the poster.
+            # This is instant, atomic, and has zero race condition risk.
             row = await conn.fetchrow(
-                "SELECT expecting_next FROM channel_state WHERE channel_id=$1", channel_id
+                "SELECT msg_id FROM tracked_msgs WHERE channel_id=$1", channel_id
             )
 
-            if row and row["expecting_next"]:
-                # Reset FIRST — only one message checked per poster cycle
-                await conn.execute("""
-                    UPDATE channel_state SET expecting_next = FALSE WHERE channel_id=$1
-                """, channel_id)
-
-                # Delete only hard spam (APK / blacklist / audio+caption) — NOT links
+            if row and msg_id == row["msg_id"] + 1:
                 if is_hard_spam(message):
                     try:
                         await context.bot.delete_message(
                             chat_id=channel_id,
                             message_id=msg_id
                         )
-                        logger.info("Deleted hard spam (channel=%s, msg=%s)", channel_id, msg_id)
+                        logger.info("Deleted spam after poster (channel=%s, msg=%s)", channel_id, msg_id)
                     except Exception as e:
                         logger.warning("Could not delete spam (msg=%s): %s", msg_id, e)
 
