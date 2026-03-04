@@ -99,8 +99,14 @@ async def init_postgres(application: Application):
 # ================= HELPERS =================
 
 def is_poster(message) -> bool:
-    return bool(message.photo or message.video)
-
+    """
+    Only treat as poster if it has photo/video AND a link.
+    No link = not a poster, nothing gets tracked or deleted.
+    """
+    has_media = bool(message.photo or message.video)
+    if not has_media:
+        return False
+    return contains_link(message)
 
 def is_spam_text(text: str) -> bool:
     """
