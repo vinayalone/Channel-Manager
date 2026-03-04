@@ -53,6 +53,7 @@ async def init_postgres(application: Application):
     db_pool = await asyncpg.create_pool(DATABASE_URL)
 
     async with db_pool.acquire() as conn:
+        # Create table if it doesn't exist at all
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS tracked_msgs (
                 channel_id       BIGINT PRIMARY KEY,
@@ -61,6 +62,37 @@ async def init_postgres(application: Application):
                 candidate_text   TEXT
             );
         """)
+
+        # Auto-migration: add missing columns if table existed with old schema
+        for column, definition in [
+            ("poster_msg_id",  "BIGINT"),
+            ("candidate_id",   "BIGINT"),
+            ("candidate_text", "TEXT"),
+        ]:
+            exists = await conn.fetchval("""
+                SELECT COUNT(*) FROM information_schema.columns
+                WHERE table_name='tracked_msgs' AND column_name=$1
+            """, column)
+            if not exists:
+                await conn.execute(
+                    f"ALTER TABLE tracked_msgs ADD COLUMN {column} {definition};"
+                )
+                logger.info("Migration: added column '%s' to tracked_msgs", column)
+
+        # Old schema had msg_id — migrate its data into poster_msg_id then drop it
+        old_col_exists = await conn.fetchval("""
+            SELECT COUNT(*) FROM information_schema.columns
+            WHERE table_name='tracked_msgs' AND column_name='msg_id'
+        """)
+        if old_col_exists:
+            await conn.execute("""
+                UPDATE tracked_msgs SET poster_msg_id = msg_id WHERE poster_msg_id IS NULL;
+            """)
+            await conn.execute("ALTER TABLE tracked_msgs DROP COLUMN msg_id;")
+            logger.info("Migration: moved msg_id -> poster_msg_id and dropped old column")
+
+        # Drop channel_state table if it exists from old versions
+        await conn.execute("DROP TABLE IF EXISTS channel_state;")
 
     logger.info("PostgreSQL connected and tables ready.")
 
